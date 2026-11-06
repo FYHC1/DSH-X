@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { WSL_AGENT_SCRIPT, WSL_SYSTEMD_SCRIPT } from '../src/wsl-scripts.js'
+import { WSL_AGENT_SCRIPT, WSL_BRIDGE_SCRIPT, WSL_HELPER_SCRIPT, WSL_SYSTEMD_SCRIPT } from '../src/wsl-scripts.js'
 import { safeLaunchPresets, safeWslServiceMode } from '../src/settings.js'
 import {
   DEFAULT_HOME,
@@ -220,4 +220,43 @@ test('systemd 脚本：user unit 用专用 unit 名，前台 exec dsh，停止�
   assert.match(WSL_SYSTEMD_SCRIPT, /systemctl --user stop --no-block/)
   assert.match(WSL_SYSTEMD_SCRIPT, /systemctl --user kill --signal=SIGKILL/)
   assert.match(WSL_SYSTEMD_SCRIPT, /exec \$\(printf '%q' "\$dsh_cmd"\)/)
+})
+
+
+test('Runtime Bridge 和插件代理脚本带完整协议与开关入口', () => {
+  assert.match(WSL_BRIDGE_SCRIPT, /method === 'ping'/)
+  assert.match(WSL_BRIDGE_SCRIPT, /method === 'getStatus'/)
+  assert.match(WSL_BRIDGE_SCRIPT, /method === 'getRuntimeInfo'/)
+  assert.match(WSL_BRIDGE_SCRIPT, /method === 'shutdown'/)
+  assert.match(WSL_BRIDGE_SCRIPT, /request\.token !== token/)
+  assert.match(WSL_HELPER_SCRIPT, /from '\.\/plugins\.mjs'/)
+  assert.match(WSL_HELPER_SCRIPT, /setPluginEnabled/)
+  assert.match(WSL_HELPER_SCRIPT, /__DSHX_JSON__/)
+  // 整合包代理要能把 packs.js 搬进 WSL，并区分“列出/计划/安装/卸载”四种动作。
+  assert.match(WSL_HELPER_SCRIPT, /import\('\.\/packs\.mjs'\)/)
+  assert.match(WSL_HELPER_SCRIPT, /action === 'pack-plan'/)
+  assert.match(WSL_HELPER_SCRIPT, /action === 'pack-install'/)
+  // 默认 profile 也要装到目标 profile 目录，不能落回 home/profiles。
+  assert.match(WSL_HELPER_SCRIPT, /const targetDir = home\.replace/)
+  assert.match(WSL_HELPER_SCRIPT, /listPlugins\(targetDir\)/)
+  assert.match(WSL_HELPER_SCRIPT, /action === 'pack-uninstall'/)
+  assert.match(WSL_HELPER_SCRIPT, /action === 'toggle-group'/)
+  assert.ok(WSL_HELPER_SCRIPT.includes('\\.(?:c|m)?js$'), 'dsh 路径判断要保留转义后的点号')
+})
+
+
+test('WSL 插件与整合包 helper 路由没有被本地文件 guard 一刀切挡掉', () => {
+  const source = readFileSync(new URL('../src/server.js', import.meta.url), 'utf8')
+  assert.match(source, /const WSL_REMOTE_API = new Set\(\[/)
+  for (const route of [
+    'GET /api/plugins',
+    'POST /api/plugins/toggle',
+    'POST /api/packs/inspect',
+    'POST /api/packs/install',
+    'POST /api/packs/toggle',
+    'POST /api/packs/uninstall',
+  ]) {
+    assert.ok(source.includes(`'${route}'`), '缺少 WSL 路由白名单：' + route)
+  }
+  assert.match(source, /!isWslRemoteApiRoute\(req\.method, url\.pathname\)/)
 })

@@ -817,7 +817,7 @@
         <!-- 自定义档就是原来那张完整表单：版本、端口、名称、目录、Profile 全手动挑。切到「自定义」tab
              才显示，前两档整块藏起来（见 setLaunchIsolation）；编辑老启动项时直接露出来。 -->
         <!-- 运行位置：本机走原来的 Windows 侧 dsh；WSL 交给 wsl.exe 拉起 Linux 里的 dsh。
-             首版只支持已装好的 WSL dsh：版本、插件、修复都归 WSL 自己管，这里只负责启动/停止/打开。 -->
+             WSL 的版本、插件和整合包都由 DSH-X 通过发行版内的 helper 管理。 -->
         <div class="home-field" id="launchBackendField" hidden>
           <label data-i18n="运行位置">运行位置</label>
           <div class="launch-isolation-tabs" id="launchBackendTabs" role="radiogroup" aria-label="运行位置" data-i18n-aria-label="运行位置" data-active="local">
@@ -7766,7 +7766,7 @@
       if (!document.documentElement.classList.contains('reduce-motion') && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
         packPluginListEl.animate([{ opacity: 0, transform: 'translateY(5px)' }, { opacity: 1, transform: 'translateY(0)' }], { duration: 180, easing: 'ease-out' })
       }
-      void refreshPluginUpdates({ quiet: true }).catch(() => {})
+      if (entry.backend !== 'wsl') void refreshPluginUpdates({ quiet: true }).catch(() => {})
     }
 
     async function closeLaunchPlugins({ afterDelete = false } = {}) {
@@ -7882,6 +7882,8 @@
       if (Array.isArray(data?.packs)) {
         ++pluginLoadRequest
         if (data.home) state.profilesByHome = { ...state.profilesByHome, [data.home]: data.profiles || [] }
+        // WSL 环境查不了 npm registry 的插件更新；不清空的话会残留上一个本机环境的更新角标。
+        if (String(data.home || '').startsWith('wsl://')) pluginUpdates = {}
         packState = { ...packState, ...data, profile: pluginProfile }
         renderPackGrid()
         renderPackView()
@@ -8034,8 +8036,9 @@
         if (context !== pluginContextKey() || request !== pluginLoadRequest) return
         paintPluginProfiles(data.profiles || [])
         applyPluginPayload(data)
-        // 版本信息拿到后再查一次 registry：查不到（离线/私有包）就静默跳过，别打扰
-        if (checkUpdates) void refreshPluginUpdates({ quiet: true }).catch(() => {})
+        // 版本信息拿到后再查一次 registry：查不到（离线/私有包）就静默跳过，别打扰；
+        // WSL 环境不归 Windows 侧查更新，直接跳过。
+        if (checkUpdates && !String(pluginTargetHome() || '').startsWith('wsl://')) void refreshPluginUpdates({ quiet: true }).catch(() => {})
         const names = (data.autoFix?.plugins || []).map((item) => item.name || item.id).filter(Boolean)
         if (names.length) notify(t('上次启动自动禁用了：{names}（点开正在用的那张卡可以重新打开）。', { names: names.join('、') }), t('兼容模式'))
         pluginsLoaded = true
@@ -8411,6 +8414,12 @@
     function renderPackGrid() {
       paintPluginHomes()
       const list = Array.isArray(packState.packs) ? packState.packs : []
+      // WSL 环境没有 Windows 侧可读的 profile 目录：备份、复制、重命名、删除都走本地文件系统，
+      // 这里只能隐藏；整合包安装/卸载仍通过 WSL helper 完成。
+      const wsl = String(packState.home || '').startsWith('wsl://')
+      // WSL 的 profile 目录在发行版里，Windows 侧的「新建 Profile」接口碰不到它；
+      // 需要新环境时先装整合包（helper 会在 WSL 内建好 profile）。
+      document.getElementById('profileAdd').hidden = wsl
       document.getElementById('profileAdd').disabled = Boolean(packBusy || pluginUpdating)
       const cards = list.map((item) => {
         const tags = packSourceTags(item)
@@ -8425,12 +8434,12 @@
             ${tags.length ? `<div class="pack-card-tags">${tags.map((tag) => `<span class="pack-tag">${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
           </div>
           <span class="pack-card-arrow" aria-hidden="true">›</span>
-        </button><details class="pack-more profile-menu"><summary title="${escapeHtml(t('更多操作'))}" aria-label="${escapeHtml(t('更多操作'))}"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></summary><div class="pack-more-actions">
+        </button>${wsl ? '' : `<details class="pack-more profile-menu"><summary title="${escapeHtml(t('更多操作'))}" aria-label="${escapeHtml(t('更多操作'))}"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></summary><div class="pack-more-actions">
           <button class="ghost" type="button" data-profile-backups="${escapeHtml(item.profile)}">${packMoreIcons.backup}${escapeHtml(t('备份与回退'))}</button>
           <button class="ghost" type="button" data-profile-copy="${escapeHtml(item.profile)}" ${packBusy || pluginUpdating ? 'disabled' : ''}>${packMoreIcons.copy}${escapeHtml(t('复制 Profile'))}</button>
           <button class="ghost" type="button" data-profile-rename="${escapeHtml(item.profile)}" ${!removable || packBusy || pluginUpdating ? 'disabled' : ''} ${!removable ? `title="${escapeHtml(t('系统环境不能重命名'))}"` : ''}>${packMoreIcons.rename}${escapeHtml(t('重命名 Profile'))}</button>
           <button class="ghost danger" type="button" data-profile-delete="${escapeHtml(item.profile)}" ${!removable || packBusy || pluginUpdating ? 'disabled' : ''} ${!removable ? `title="${escapeHtml(t('系统环境不能删除'))}"` : ''}>${packMoreIcons.trash}${escapeHtml(t('删除 Profile'))}</button>
-        </div></details></div>`
+        </div></details>`}</div>`
       }).join('')
       // 安装整合包的入口在环境详情里（装进这个环境），网格里不再放独立的加卡
       packGridEl.innerHTML = cards
@@ -8563,12 +8572,15 @@
       const records = item.records || []
       // 桌面增强的合成记录（synthetic）不算「最近安装的整合包」，卸载按钮只对真实记录开放
       const latest = records.filter((record) => !record.synthetic).at(-1)
+      // WSL 环境的 profile 目录在 Linux 里：检查更新/导出/复制/重命名/删除都做不了，
+      // 只保留装整合包和组级卸载；这些操作由 WSL helper 在发行版内完成。
+      const wsl = String(packState.home || '').startsWith('wsl://')
       // 顶部只剩一行：左上返回图标（在静态结构里），右上全部操作；批量启停收进「更多操作」
       packHeadEl.innerHTML = `
         <button class="ghost icon-btn pack-tool" type="button" data-pack-import="1" title="${escapeHtml(t('装整合包'))}" aria-label="${escapeHtml(t('装整合包'))}" ${packBusy || pluginUpdating ? 'disabled' : ''}>${packMoreIcons.install}</button>
-        ${item.profile === packState.profile ? `<button class="ghost icon-btn pack-tool${pluginChecking ? ' is-checking' : ''}" type="button" data-pack-check-updates="1" title="${escapeHtml(t('检查更新'))}" aria-label="${escapeHtml(t('检查更新'))}" aria-busy="${pluginChecking}" ${pluginChecking || pluginUpdating || packBusy ? 'disabled' : ''}>${packMoreIcons.refresh}</button>` : ''}
-        ${pending || pluginUpdating === '*' ? `<button class="ghost icon-btn pack-tool pack-update${pluginUpdating === '*' ? ' loading' : ''}" type="button" data-pack-update="1" title="${escapeHtml(t('更新 {n} 个', { n: pending }))}" aria-label="${escapeHtml(t('更新 {n} 个', { n: pending }))}" aria-busy="${pluginUpdating === '*'}" ${pluginUpdating || packBusy ? 'disabled' : ''}><span class="spin" aria-hidden="true"></span>${packMoreIcons.update}<span class="pack-update-count" aria-hidden="true">${pending}</span></button>` : ''}
-        <details class="pack-more">
+        ${wsl ? '' : item.profile === packState.profile ? `<button class="ghost icon-btn pack-tool${pluginChecking ? ' is-checking' : ''}" type="button" data-pack-check-updates="1" title="${escapeHtml(t('检查更新'))}" aria-label="${escapeHtml(t('检查更新'))}" aria-busy="${pluginChecking}" ${pluginChecking || pluginUpdating || packBusy ? 'disabled' : ''}>${packMoreIcons.refresh}</button>` : ''}
+        ${!wsl && (pending || pluginUpdating === '*') ? `<button class="ghost icon-btn pack-tool pack-update${pluginUpdating === '*' ? ' loading' : ''}" type="button" data-pack-update="1" title="${escapeHtml(t('更新 {n} 个', { n: pending }))}" aria-label="${escapeHtml(t('更新 {n} 个', { n: pending }))}" aria-busy="${pluginUpdating === '*'}" ${pluginUpdating || packBusy ? 'disabled' : ''}><span class="spin" aria-hidden="true"></span>${packMoreIcons.update}<span class="pack-update-count" aria-hidden="true">${pending}</span></button>` : ''}
+        ${wsl ? '' : `<details class="pack-more">
           <summary title="${escapeHtml(t('更多操作'))}" aria-label="${escapeHtml(t('更多操作'))}"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></summary>
           <div class="pack-more-actions">
             <button class="ghost" type="button" data-pack-export="1" ${packBusy || pluginUpdating ? 'disabled' : ''}>${packMoreIcons.export}${escapeHtml(t('导出当前环境'))}</button>
@@ -8576,7 +8588,7 @@
             ${item.removable ? `<button class="ghost" type="button" data-profile-rename="1" ${packBusy || pluginUpdating ? 'disabled' : ''}>${packMoreIcons.rename}${escapeHtml(t('重命名 Profile'))}</button>` : ''}
             ${item.removable ? `<button class="ghost danger" type="button" data-pack-delete="1" ${packBusy || pluginUpdating ? 'disabled' : ''}>${packMoreIcons.trash}${escapeHtml(t('删除 Profile'))}</button>` : ''}
           </div>
-        </details>`
+        </details>`}`
       const actions = packHeadEl
       actions.querySelector('[data-pack-import]')?.addEventListener('click', () => openImportDialog())
       actions.querySelector('[data-pack-check-updates]')?.addEventListener('click', async () => {
@@ -8619,7 +8631,7 @@
           const updating = pluginUpdating === '*' && pluginUpdatingGroup === group.key
           const disabled = packBusy || pluginUpdating || pluginTogglePending.size
           return `<div class="plugin-group-card"><div class="plugin-group-tools">
-            ${updates || updating ? `<button class="ghost icon-btn group-update${updating ? ' loading' : ''}" type="button" data-group-update="${escapeHtml(group.key)}" title="${escapeHtml(t('更新 {name} 的 {n} 个插件', { name: group.name, n: updates }))}" aria-label="${escapeHtml(t('更新 {name} 的 {n} 个插件', { name: group.name, n: updates }))}" ${disabled ? 'disabled' : ''}><span class="spin" aria-hidden="true"></span>${packMoreIcons.update}<span class="pack-update-count" aria-hidden="true">${updates}</span></button>` : ''}
+            ${!wsl && (updates || updating) ? `<button class="ghost icon-btn group-update${updating ? ' loading' : ''}" type="button" data-group-update="${escapeHtml(group.key)}" title="${escapeHtml(t('更新 {name} 的 {n} 个插件', { name: group.name, n: updates }))}" aria-label="${escapeHtml(t('更新 {name} 的 {n} 个插件', { name: group.name, n: updates }))}" ${disabled ? 'disabled' : ''}><span class="spin" aria-hidden="true"></span>${packMoreIcons.update}<span class="pack-update-count" aria-hidden="true">${updates}</span></button>` : ''}
             ${record && !record.synthetic ? `<button class="ghost icon-btn danger" type="button" data-group-remove="${escapeHtml(group.key)}" title="${escapeHtml(record === latest ? t('卸载 {name}', { name: group.name }) : t('请先卸载此后安装的整合包'))}" aria-label="${escapeHtml(t('卸载 {name}', { name: group.name }))}" ${disabled || record !== latest ? 'disabled' : ''}>${packMoreIcons.trash}</button>` : ''}
             <label class="toggle plugin-group-toggle" title="${escapeHtml([mixed ? t('部分启用') : '', t(enabled ? '禁用 {name}' : '启用 {name}', { name: group.name })].filter(Boolean).join(' · '))}"><input type="checkbox" data-group-toggle="${escapeHtml(group.key)}" aria-label="${escapeHtml(t(enabled ? '禁用 {name}' : '启用 {name}', { name: group.name }))}" ${enabled ? 'checked' : ''} ${switching ? 'class="is-switching" aria-busy="true"' : ''} ${disabled || !toggleable.length ? 'disabled' : ''}/></label>
           </div><details class="plugin-group" data-plugin-group="${escapeHtml(group.key)}" ${expanded.get(group.key) !== false ? 'open' : ''}>

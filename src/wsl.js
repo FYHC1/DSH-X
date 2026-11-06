@@ -23,11 +23,11 @@ SOFTWARE.
 */
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
 import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
-import { WSL_AGENT_SCRIPT, WSL_SYSTEMD_SCRIPT } from './wsl-scripts.js'
+import { WSL_AGENT_SCRIPT, WSL_BRIDGE_SCRIPT, WSL_HELPER_SCRIPT, WSL_SYSTEMD_SCRIPT } from './wsl-scripts.js'
 
 // 允许用 DSH_WSL_EXE 指向自定义 wsl.exe；默认先找 System32，找不到再交给 PATH。
 // 不把 wsl.exe 的存在当成 DSH-X 的运行前提：只有探测/启动 WSL 时才 spawn 它。
@@ -338,6 +338,52 @@ async function installAgentScript(distro) {
     const result = await wslBash(distro, buildAgentInstallScript(text, name), { timeoutMs: 20000 })
     if (!result.ok) throw new Error('写入 WSL 启动脚本失败：' + (result.stderr.trim() || result.stdout.trim() || '未知错误'))
   }
+
+  // 插件代理和整合包代理要跑在 WSL 里，源码随脚本一起送进去；plugins.js 有 20KB，
+  // 单个文件再按 8KB 切片，避免一条 wsl.exe 命令行撞 Windows 的 32K 参数上限。
+  let pluginsSource = ''
+  try {
+    pluginsSource = readFileSync(new URL('./plugins.js', import.meta.url), 'utf8')
+  } catch { /* 打包目录缺文件时插件代理降级，不影响启动 */ }
+  // packs.js 只依赖 node: 内置和同目录的 zip.js/zipfile.js，可以原样搬进 WSL 执行。
+  // 复制时只改相对导入的后缀：WSL 里的文件统一叫 .mjs，Node 才不会把包目录当 CommonJS。
+  const packSources = [
+    ['packs.mjs', './packs.js', [['./zip.js', './zip.mjs']]],
+    ['zip.mjs', './zip.js', [['./zipfile.js', './zipfile.mjs']]],
+    ['zipfile.mjs', './zipfile.js', []],
+  ].map(([name, file, replacements]) => {
+    try {
+      let text = readFileSync(new URL(file, import.meta.url), 'utf8')
+      for (const [from, to] of replacements) text = text.split(from).join(to)
+      return [name, text, '644']
+    } catch {
+      return null
+    }
+  }).filter(Boolean)
+  const files = [
+    ['dsh-x-bridge.mjs', WSL_BRIDGE_SCRIPT, '644'],
+    ['dsh-x-helper.mjs', WSL_HELPER_SCRIPT, '644'],
+    ...(pluginsSource ? [['plugins.mjs', pluginsSource, '644']] : []),
+    ...packSources,
+  ]
+  for (const [name, text, mode] of files) {
+    const base64 = Buffer.from(String(text), 'utf8').toString('base64')
+    const chunks = []
+    for (let index = 0; index < base64.length; index += 8000) chunks.push(base64.slice(index, index + 8000))
+    // 每一片单独一条 wsl.exe：runBashScript 还会把整条脚本再 base64 一次，几片拼在一起同样会超限。
+    for (let index = 0; index < chunks.length; index += 1) {
+      const script = [
+        'set -eu',
+        'd="$HOME/.dsh-x/bin"',
+        'mkdir -p "$d"',
+        "printf '%s' '" + chunks[index] + "' | base64 -d " + (index === 0 ? '>' : '>>') + ' "$d/' + name + '"',
+      ].join('\n')
+      const result = await wslBash(distro, script, { timeoutMs: 20000 })
+      if (!result.ok) throw new Error('写入 WSL 启动脚本失败：' + (result.stderr.trim() || result.stdout.trim() || '未知错误'))
+    }
+    const chmodResult = await wslBash(distro, 'chmod ' + mode + ' "$HOME/.dsh-x/bin/' + name + '"', { timeoutMs: 20000 })
+    if (!chmodResult.ok) throw new Error('设置 WSL 启动脚本权限失败：' + (chmodResult.stderr.trim() || chmodResult.stdout.trim() || '未知错误'))
+  }
 }
 
 export function wslHomeKey(distro, home) {
@@ -555,6 +601,79 @@ export async function stopWslExternal(options) {
   ].join('\n')
   const result = await runBashScript(options.distro, script, { timeoutMs: 10000 })
   return { ok: result.ok, stdout: result.stdout, stderr: result.stderr }
+}
+
+async function runWslHelper(distro, action, args, options = {}) {
+  await installAgentScript(distro)
+  const extra = [
+    args.name ? ' --name ' + shellQuote(args.name) : '',
+    args.enabled === undefined ? '' : ' --enabled ' + shellQuote(args.enabled ? '1' : '0'),
+    args.file ? ' --file ' + shellQuote(args.file) : '',
+    args.spec ? ' --spec ' + shellQuote(args.spec) : '',
+    args.dsh ? ' --dsh ' + shellQuote(args.dsh) : '',
+    args.pnpm ? ' --pnpm ' + shellQuote(args.pnpm) : '',
+    args.hostProfile ? ' --host-profile ' + shellQuote(args.hostProfile) : '',
+    args.group ? ' --group ' + shellQuote(args.group) : '',
+    args.pack !== undefined ? ' --pack ' + shellQuote(args.pack) : '',
+  ].join('')
+  const command = [
+    'home=' + shellQuote(args.home || DEFAULT_HOME),
+    'case "$home" in',
+    '  "~") home="$HOME" ;;',
+    '  "~/"*) home="$HOME/${home:2}" ;;',
+    'esac',
+    'node "$HOME/.dsh-x/bin/dsh-x-helper.mjs" ' + shellQuote(action) + ' --home "$home" --profile ' + shellQuote(args.profile || '') + extra,
+  ].join('\n')
+  const result = await runBashScript(distro, command, { timeoutMs: options.timeoutMs || 20000, onLine: options.onLine })
+  const lines = String(result.stdout || '').split(/\r?\n/)
+  const line = lines.find((item) => item.indexOf('__DSHX_JSON__') === 0)
+  if (!line) throw new Error('WSL 插件代理没有返回数据：' + (result.stderr.trim() || result.stdout.trim() || '无输出'))
+  let payload
+  try { payload = JSON.parse(line.slice('__DSHX_JSON__'.length)) } catch { throw new Error('WSL 插件代理返回了坏 JSON') }
+  if (!payload.ok) throw new Error(payload.error || 'WSL 插件代理执行失败')
+  return payload
+}
+
+export function wslPluginList(distro, home, profile) {
+  return runWslHelper(distro, 'list', { home, profile })
+}
+
+export function wslPluginToggle(distro, home, profile, name, enabled) {
+  return runWslHelper(distro, 'toggle', { home, profile, name, enabled })
+}
+
+export function wslPackPlan(distro, home, profile, file, options = {}) {
+  return runWslHelper(distro, 'pack-plan', { home, profile, file, hostProfile: options.hostProfile || '' }, {
+    timeoutMs: options.timeoutMs || 60000,
+    onLine: options.onLine,
+  })
+}
+
+export function wslPackInstall(distro, home, profile, file, dsh, options = {}) {
+  return runWslHelper(distro, 'pack-install', { home, profile, file, dsh, pnpm: options.pnpm || '' }, {
+    timeoutMs: options.timeoutMs || 30 * 60 * 1000,
+    onLine: options.onLine,
+  })
+}
+
+export function wslPackUninstall(distro, home, profile, name, options = {}) {
+  return runWslHelper(distro, 'pack-uninstall', { home, profile, name }, {
+    timeoutMs: options.timeoutMs || 60000,
+    onLine: options.onLine,
+  })
+}
+
+export function wslPackToggle(distro, home, profile, selector = {}, options = {}) {
+  return runWslHelper(distro, 'toggle-group', {
+    home,
+    profile,
+    group: selector.group || '',
+    pack: selector.pack === undefined ? '' : selector.pack,
+    enabled: selector.enabled,
+  }, {
+    timeoutMs: options.timeoutMs || 60000,
+    onLine: options.onLine,
+  })
 }
 
 export { WSL_EXE, DEFAULT_HOME }

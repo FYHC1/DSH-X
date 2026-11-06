@@ -136,7 +136,7 @@ import {
   saveSettings,
   VERSION_RE,
 } from './settings.js'
-import { allocateWslPort, inspectWslDistro, invalidateWslCache, listWslDistros, parseWslHomeKey, probeWslDshPort, resolveWslHome, startWslInstance, stopWslExternal, stopWslInstance, wslAvailable, wslDistroSnapshot, wslHomeKey, wslPortAvailable } from './wsl.js'
+import { allocateWslPort, inspectWslDistro, invalidateWslCache, listWslDistros, parseWslHomeKey, probeWslDshPort, resolveWslHome, startWslInstance, stopWslExternal, stopWslInstance, wslAvailable, wslDistroSnapshot, wslHomeKey, wslPackInstall, wslPackPlan, wslPackToggle, wslPackUninstall, wslPluginList, wslPluginToggle, wslPortAvailable } from './wsl.js'
 // 带代理的 fetch：Node 的全局 fetch 既不看系统代理也不看 HTTP_PROXY，外网请求都走 netFetch
 import { netFetch, proxyEnv, resetProxyCache, resolveProxy } from './proxy.js'
 import { APP_DIR, fileManager } from './filemanager.js'
@@ -484,6 +484,22 @@ const WSL_LOCAL_API_EXACT = new Set([
 function isWslLocalApiRoute(pathname) {
   return WSL_LOCAL_API_EXACT.has(pathname)
     || WSL_LOCAL_API_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(prefix + '/'))
+}
+// 这些接口在 WSL 启动项下有专门的 helper 分支（插件列表/开关、整合包检查/安装/卸载/组开关），
+// 还有几个只碰市场索引或 Windows 文件选择器、不会读写 WSL 目录的辅助接口；不能一刀切挡掉。
+const WSL_REMOTE_API = new Set([
+  'GET /api/plugins',
+  'POST /api/plugins/toggle',
+  'GET /api/packs/market',
+  'GET /api/packs/market/stats',
+  'POST /api/packs/pick-file',
+  'POST /api/packs/inspect',
+  'POST /api/packs/install',
+  'POST /api/packs/toggle',
+  'POST /api/packs/uninstall',
+])
+function isWslRemoteApiRoute(method, pathname) {
+  return WSL_REMOTE_API.has(String(method || '').toUpperCase() + ' ' + pathname)
 }
 function launchDistro() {
   const store = launchScope.getStore()
@@ -4390,6 +4406,53 @@ function packsPayload() {
   }
 }
 
+/**
+ * WSL profile 的插件载荷。
+ *
+ * WSL 里的 profile 目录在 Linux 文件系统里，Windows 侧读不到，所以插件列表/开关
+ * 由 WSL 里的 helper（和 plugins.js/packs.js 同一套实现）算完再通过 stdout 送回来。
+ * 这里把它拼成和 packsPayload 一样的形状，页面不用区分数据源。
+ */
+function wslPluginPayload(profile, data) {
+  const plugins = Array.isArray(data?.plugins) ? data.plugins : []
+  const thirdParty = plugins.filter((plugin) => !plugin.official)
+  const records = Array.isArray(data?.packs) ? data.packs.filter((record) => record.profile === profile) : []
+  const latest = records.length ? records[records.length - 1] : null
+  const card = {
+    profile,
+    name: profile,
+    pluginCount: plugins.length,
+    officialCount: plugins.length - thirdParty.length,
+    enabled: thirdParty.some((plugin) => plugin.enabled),
+    toggleable: thirdParty.some((plugin) => plugin.toggleable),
+    plugins,
+    records,
+    source: latest?.source || '',
+    installedAt: latest?.installedAt || '',
+    packName: latest ? (latest.displayName || latest.name) : '',
+    packVersion: latest?.version || '',
+    createdProfile: records.some((record) => record.createdProfile === true),
+    template: TEMPLATE_PROFILES.includes(profile),
+    removable: !CLI_BLOCKED_PROFILES.has(profile.toLowerCase()),
+  }
+  return {
+    packs: [card],
+    profile,
+    home: homeDir(),
+    profiles: [profile],
+    marketUrl: process.env.DSH_PACK_MARKET || MARKET_INDEX_URL,
+    busy: false,
+    progress: null,
+    builtin: null,
+    patchPath: data?.patchPath || '',
+    profileDir: data?.profileDir || '',
+    plugins,
+    disables: Array.isArray(data?.disables) ? data.disables : [],
+    autoFix: null,
+    recovery: null,
+  }
+}
+
 /** 从安装记录声明里取插件归属，再与当前 profile 的真实依赖取交集。 */
 function packPluginSelection(profile, plugins, selector) {
   const installed = readPackState(packDataDir()).packs.filter((record) => record.profile === profile)
@@ -4799,6 +4862,30 @@ async function install(version) {
   }
 }
 
+/** 整合包操作里请求没带发行版/目录时沿当前 WSL 启动项。 */
+function wslPackTarget(body = {}) {
+  const distro = safeWslDistro(body.distro) || launchDistro()
+  if (!distro) throw new Error('先选择一个 WSL 发行版')
+  const home = safeWslPath(body.home, 'WSL 用户目录') || launchWslHome()
+  return { distro, home }
+}
+
+/** WSL 的 profile 目录在发行版里，本机的 withIdleProfile 看不到它，只能在实例表里按发行版挡住。 */
+function assertWslPackIdle(distro, profile) {
+  const running = instanceList().find((proc) => proc.backend === 'wsl' && proc.distro === distro && proc.profile === profile && ['running', 'starting', 'stopping'].includes(proc.status))
+  if (running) throw new Error(`WSL 里的 profile「${profile}」还有实例在运行，先停止再卸载整合包`)
+}
+
+/** WSL 整合包安装要调用 WSL 里的 dsh 命令；首版沿用全局设置里的 dshCommand。 */
+async function launchWslDshCommand() {
+  return String(WSL_SETTINGS.dshCommand || 'dsh') || 'dsh'
+}
+
+/** 打包版核心自带一份 pnpm；WSL 里没装原生 pnpm 时，用它写一个 WSL 侧包装，别让 dsh 调到 Windows 的 pnpm.exe。 */
+function bundledPnpmCli() {
+  const cli = join(ROOT, 'node', 'node_modules', 'pnpm', 'bin', 'pnpm.cjs')
+  return existsSync(cli) ? cli : ''
+}
 /** npm 整理时会移动文件，启动准备和插件命令也必须纳入互斥，不能只看已启动的进程。 */
 async function optimizeVersion(version) {
   const ver = safeVersion(version)
@@ -6656,7 +6743,7 @@ async function handleApi(req, res, url) {
   }
   // WSL 启动项的文件都在发行版里，Windows 侧只负责拉起进程；
   // 统一在这里挡住本地文件路由，避免把 wsl:// 键当成 Windows 路径。
-  if (launchIsWsl() && isWslLocalApiRoute(url.pathname)) {
+  if (launchIsWsl() && isWslLocalApiRoute(url.pathname) && !isWslRemoteApiRoute(req.method, url.pathname)) {
     send(res, 400, { error: 'WSL 启动项的 Profile、插件和整合包文件都在 WSL 内，当前版本不支持在 Windows 侧直接管理；请进入该发行版操作。' })
     return
   }
@@ -6829,6 +6916,15 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/api/plugins') {
     // 浏览插件的 profile 与启动默认值分开；查看另一份配置不能偷偷改变启动行为。
     const profile = safeProfile(url.searchParams.get('profile') || PROFILE_NAME)
+    if (launchIsWsl()) {
+      try {
+        const data = await wslPluginList(launchDistro(), launchWslHome(), profile)
+        send(res, 200, wslPluginPayload(profile, data))
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
     send(res, 200, { ...packsPayload(), ...listPlugins(profileDirOf(profile)), profile, autoFix: autoFixForHome(), recovery: recoveryPayload(profile) })
     return
   }
@@ -7355,6 +7451,16 @@ async function handleApi(req, res, url) {
     const enabled = body.enabled !== false
     // 整合包卡片可能装在别的 profile 上，切换插件时得能指定目标（不传就是当前 profile）
     const profile = safeProfile(String(body.profile || PROFILE_NAME))
+    if (launchIsWsl()) {
+      try {
+        const result = await wslPluginToggle(launchDistro(), launchWslHome(), profile, name, enabled)
+        pushLog(`插件 ${name} → ${enabled ? '启用' : '禁用'}（WSL ${launchDistro()} / profile ${profile}）${result.changed ? '' : '（无变化）'}`)
+        send(res, 200, { ok: true, changed: result.changed === true, ...wslPluginPayload(profile, result) })
+      } catch (error) {
+        send(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
     const target = profileDirOf(profile)
     const result = await editProfile(profile, () => setPluginEnabled(target, name, enabled))
     const where = body.profile && String(body.profile) !== PROFILE_NAME ? `（profile ${body.profile}）` : ''
@@ -7408,6 +7514,42 @@ async function handleApi(req, res, url) {
   }
   // ---- 整合包：检查 / 安装 / 卸载 / 导出 ----
 
+  if (req.method === 'POST' && url.pathname === '/api/packs/inspect' && launchIsWsl()) {
+    const token = String(body.token || '') || newPackToken()
+    const found = body.token ? packInspectCache.get(token) : null
+    const cached = found?.home === homeDir() ? found : null
+    if (body.token && !cached) {
+      send(res, 400, { error: '这次检查已经过期，重新选择整合包再试' })
+      return
+    }
+    const source = body.market
+      ? { kind: 'market', id: String(body.market.id || ''), url: String(body.market.downloadUrl || ''), sha256: String(body.market.sha256 || ''), size: Number(body.market.size) || 0, name: String(body.market.name || '') }
+      : String(body.source || '')
+    packProgressName = body.market ? String(body.market.displayName || body.market.name || '') : String(body.source || '')
+    emitPackProgress({ phase: 'fetch', done: 0, total: 0 })
+    try {
+      const target = wslPackTarget(body)
+      const opened = cached
+        ? { file: cached.file, source: cached.source, token, bytes: cached.bytes || 0 }
+        : await openPackSource(source, { token, onProgress: (state) => emitPackProgress(state) })
+      void prunePackInbox()
+      if (opened.token) {
+        packInspectCache.set(opened.token, { home: homeDir(), file: opened.file, source: opened.source, raw: cached ? cached.raw : source, bytes: opened.bytes || 0, at: Date.now() })
+      }
+      const requestedProfile = String(body.profile || '').trim()
+      const payload = { ok: true, token: opened.token, source: opened.source, bytes: opened.bytes || 0, ...await wslPackPlan(target.distro, target.home, requestedProfile ? safeProfile(requestedProfile) : '', opened.file, { hostProfile: PROFILE_NAME }) }
+      pushLog(`WSL 整合包检查：${payload.pack.displayName || payload.pack.name} ${payload.pack.version}（${payload.pack.bundles.length} 层、${payload.pack.dependencies.length} 个依赖）${payload.ok ? '' : '，有问题'}`)
+      send(res, 200, payload)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      pushLog(`WSL 整合包检查失败：${message}`)
+      send(res, 400, { ok: false, error: message })
+    } finally {
+      packProgressName = ''
+      emitPackProgress(null)
+    }
+    return
+  }
   if (req.method === 'POST' && url.pathname === '/api/packs/inspect') {
     const token = String(body.token || '') || newPackToken()
     const found = body.token ? packInspectCache.get(token) : null
@@ -7439,6 +7581,68 @@ async function handleApi(req, res, url) {
       pushLog(`整合包检查失败：${message}`)
       send(res, 400, { ok: false, error: message })
     } finally {
+      packProgressName = ''
+      emitPackProgress(null)
+    }
+    return
+  }
+  if (req.method === 'POST' && url.pathname === '/api/packs/install' && launchIsWsl()) {
+    try { assertLauncherIdle() } catch (error) {
+      send(res, 400, { error: error.message })
+      return
+    }
+    if (pluginBusy) {
+      send(res, 400, { error: '正在装插件或整合包，等它结束再试' })
+      return
+    }
+    const token = String(body.token || '')
+    const found = token ? packInspectCache.get(token) : null
+    const cached = found?.home === homeDir() ? found : null
+    const source = cached ? (cached.raw ?? cached.source) : (body.market
+      ? { kind: 'market', id: String(body.market.id || ''), url: String(body.market.downloadUrl || ''), sha256: String(body.market.sha256 || ''), size: Number(body.market.size) || 0, name: String(body.market.name || '') }
+      : String(body.source || ''))
+    if (!cached && !body.source && !body.market) {
+      send(res, 400, { error: token ? '这次检查的临时文件已经过期了，回到上一步重新检查一次再装' : '先检查一次整合包，再点安装' })
+      return
+    }
+    pluginBusy = true
+    packInstalling = true
+    packProgressName = body.market ? String(body.market.displayName || body.market.name || '') : String(body.source || 'WSL 整合包')
+    emitPackProgress({ phase: 'install', step: 'resolve', done: 0, total: 0 })
+    try {
+      const target = wslPackTarget(body)
+      const opened = cached
+        ? { file: cached.file, source: cached.source, token }
+        : await openPackSource(source, { token: token || newPackToken(), onProgress: (state) => emitPackProgress(state) })
+      const requestedProfile = String(body.profile || '').trim()
+      const safeRequested = requestedProfile ? safeProfile(requestedProfile) : ''
+      const dsh = await launchWslDshCommand(target)
+      const data = await wslPackInstall(target.distro, target.home, safeRequested, opened.file, dsh, {
+        pnpm: bundledPnpmCli(),
+        onLine: (line) => {
+          const raw = String(line || '')
+          if (!raw.startsWith('__DSHX_LOG__')) return
+          const text = raw.slice('__DSHX_LOG__'.length).trim()
+          if (text) pushLog('[WSL] ' + text)
+        },
+      })
+      const profile = data.profile || safeRequested
+      if (token) packInspectCache.delete(token)
+      emitPackProgress({ phase: 'done', done: data.plan?.writes?.length || 0, total: data.plan?.writes?.length || 0 })
+      pushLog(`WSL 整合包 ${data.installed?.name || ''} 已装进 profile「${profile}」（重启 dsh 后生效）`)
+      send(res, 200, {
+        ok: true,
+        installed: data.installed,
+        plan: data.plan,
+        ...wslPluginPayload(profile, data),
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      pushLog(`WSL 整合包安装失败：${message}`)
+      send(res, 400, { ok: false, error: message })
+    } finally {
+      packInstalling = false
+      pluginBusy = false
       packProgressName = ''
       emitPackProgress(null)
     }
@@ -7523,6 +7727,37 @@ async function handleApi(req, res, url) {
       pluginBusy = false
       packProgressName = ''
       emitPackProgress(null)
+    }
+    return
+  }
+  if (req.method === 'POST' && url.pathname === '/api/packs/toggle' && launchIsWsl()) {
+    const rawProfile = String(body.profile || '').trim()
+    if (!rawProfile) {
+      send(res, 400, { error: '要说清是哪个 profile' })
+      return
+    }
+    let profile
+    try {
+      profile = safeProfile(rawProfile)
+    } catch (error) {
+      send(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      return
+    }
+    if (pluginBusy) {
+      send(res, 400, { error: '正在装插件或整合包，等它结束再试' })
+      return
+    }
+    try {
+      const target = wslPackTarget(body)
+      const data = await wslPackToggle(target.distro, target.home, profile, {
+        group: String(body.group || ''),
+        pack: body.pack === undefined ? undefined : String(body.pack || ''),
+        enabled: body.enabled !== false,
+      })
+      pushLog(`WSL profile ${profile} 的插件 → ${body.enabled !== false ? '启用' : '禁用'}（${data.changed || 0} 个有变化${data.failed?.length ? `，${data.failed.length} 个失败` : ''}）`)
+      send(res, 200, { ok: true, ...data, ...wslPluginPayload(profile, data) })
+    } catch (error) {
+      send(res, 400, { error: error instanceof Error ? error.message : String(error) })
     }
     return
   }
@@ -7659,6 +7894,40 @@ async function handleApi(req, res, url) {
       const message = error instanceof Error ? error.message : String(error)
       pushLog(`删 profile「${profile}」失败：${message}`)
       send(res, 400, { error: message })
+    }
+    return
+  }
+  if (req.method === 'POST' && url.pathname === '/api/packs/uninstall' && launchIsWsl()) {
+    const name = String(body.name || '')
+    const rawProfile = String(body.profile || '').trim()
+    if (!name || !rawProfile) {
+      send(res, 400, { error: '要说清整合包名和 profile' })
+      return
+    }
+    let profile
+    try {
+      profile = safeProfile(rawProfile)
+    } catch (error) {
+      send(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      return
+    }
+    if (pluginBusy) {
+      send(res, 400, { error: '正在装插件或整合包，等它结束再试' })
+      return
+    }
+    pluginBusy = true
+    try {
+      const target = wslPackTarget(body)
+      assertWslPackIdle(target.distro, profile)
+      const data = await wslPackUninstall(target.distro, target.home, profile, name)
+      pushLog(`WSL 整合包 ${name} 已从 profile「${profile}」卸下（还原 ${data.restored || 0} 个文件）`)
+      send(res, 200, { ok: true, ...data, ...wslPluginPayload(profile, data) })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      pushLog(`WSL 整合包卸载失败：${message}`)
+      send(res, 400, { error: message })
+    } finally {
+      pluginBusy = false
     }
     return
   }

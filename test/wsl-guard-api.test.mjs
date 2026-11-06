@@ -39,7 +39,6 @@ test('WSL scope 下本地文件路由统一返回 400，启动与会话状态接
     return { response, data: await response.json() }
   }
   const blocked = [
-    ['/api/plugins?profile=web'],
     ['/api/plugin-profile?version=0.1.0&profile=web'],
     ['/api/launch-home/profiles'],
     ['/api/profiles/create', 'POST', { profile: 'demo' }],
@@ -50,7 +49,6 @@ test('WSL scope 下本地文件路由统一返回 400，启动与会话状态接
     ['/api/profile-backups?profile=web'],
     ['/api/profile-backups/snapshot', 'POST', { profile: 'web' }],
     ['/api/packs'],
-    ['/api/packs/install', 'POST', { file: 'demo.dspack' }],
     ['/api/plugins/update', 'POST', { name: 'demo' }],
     ['/api/plugins/upgrade-incompatible', 'POST', {}],
     ['/api/desktop-enhance/install', 'POST', {}],
