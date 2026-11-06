@@ -32,7 +32,7 @@ test('WSL 发行版归在运行位置，切到 WSL 时藏掉本机版本整组',
   const location = page.slice(start, end)
   assert.match(location, /id="launchWslDistro"/)
   assert.match(location, /id="launchWslHint"/)
-  assert.doesNotMatch(location, /launchWslServiceMode/)
+  assert.match(location, /id="launchWslServiceMode"/, '生命周期 PR 在启动项里加服务模式选择')
   assert.doesNotMatch(page, /id="launchWslVersionField"/, '核心版不包含 WSL 版本管理，版本字段留到版本管理 PR')
   assert.doesNotMatch(css, /launchWslVersionHint/, '核心版不留下 WSL 版本说明的样式')
   assert.match(page, /launchLocalVersionGroupEl\.hidden = wsl/, '本机版本下拉、版本类型、管理按钮与渠道说明要整组隐藏')

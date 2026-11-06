@@ -24,9 +24,10 @@ SOFTWARE.
 
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import net from 'node:net'
 import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
-import { WSL_AGENT_SCRIPT } from './wsl-scripts.js'
+import { WSL_AGENT_SCRIPT, WSL_SYSTEMD_SCRIPT } from './wsl-scripts.js'
 
 // 允许用 DSH_WSL_EXE 指向自定义 wsl.exe；默认先找 System32，找不到再交给 PATH。
 // 不把 wsl.exe 的存在当成 DSH-X 的运行前提：只有探测/启动 WSL 时才 spawn 它。
@@ -40,8 +41,13 @@ const HELPER_DISTRO_RE = /^(?:docker-desktop(?:-data)?|rancher-desktop(?:-data)?
 const DEFAULT_HOME = '~/.dsh'
 const SCRIPT_PATH = '$HOME/.dsh-x/bin/dsh-x-wsl.sh'
 
-/** 首版只支持 wrapper：脚本前台 exec dsh，wsl.exe 的 stdout 就是 dsh 的 stdout。 */
+/** 启动方式：wrapper 由 wsl.exe 前台托管；systemd 由 WSL 内的 systemd user unit 托管。 */
+export const WSL_SERVICE_MODES = ['wrapper', 'systemd']
 export const WSL_SERVICE_MODE = 'wrapper'
+
+export function normalizeWslServiceMode(value) {
+  return value === 'systemd' ? 'systemd' : 'wrapper'
+}
 
 export function wslAvailable() {
   if (process.platform !== 'win32') return false
@@ -135,7 +141,9 @@ export function parseWslDistroList(text) {
 }
 
 let distroCache = { at: 0, value: null }
+let distroRefresh = null
 const inspectCache = new Map()
+const systemdCache = new Map()
 
 export async function listWslDistros(options = {}) {
   if (!wslAvailable()) return { available: false, distros: [], error: '当前不是 Windows，或找不到 wsl.exe' }
@@ -151,9 +159,32 @@ export async function listWslDistros(options = {}) {
   return value
 }
 
+/**
+ * 给状态页/设置页用的非阻塞快照：有缓存就先返回旧值，过期了在后台刷新。
+ * 管理页每 1-2 秒拉一次 /api/state，不能每次都等 wsl.exe；WSL 服务忙的时候
+ * 一次 wsl --list 可能要几秒，会把整个接口拖到超时。
+ */
+export function wslDistroSnapshot() {
+  if (!wslAvailable()) return { available: false, distros: [], error: '当前不是 Windows，或找不到 wsl.exe' }
+  if (!distroCache.value) {
+    refreshWslDistros()
+    return { available: true, distros: [], error: '', pending: true }
+  }
+  if (Date.now() - distroCache.at >= 10000) refreshWslDistros()
+  return distroCache.value
+}
+
+function refreshWslDistros() {
+  if (distroRefresh) return
+  distroRefresh = listWslDistros({ force: true })
+    .catch(() => {})
+    .finally(() => { distroRefresh = null })
+}
+
 export function invalidateWslCache() {
   distroCache = { at: 0, value: null }
   inspectCache.clear()
+  systemdCache.clear()
 }
 
 async function wslExec(distro, argv, options = {}) {
@@ -164,7 +195,6 @@ async function wslExec(distro, argv, options = {}) {
 /**
  * wsl.exe 会在进入 Linux 之前再做一层命令行展开：脚本里的 $变量 会被它先吃掉，
  * 位置参数也会丢。把整段脚本 base64 后交给远端 bash 解码执行，才能保证内容原样到达。
- * 脚本本身可以用 $HOME、引号和任意多行，不经过 Windows 这一层的参数解析。
  */
 function bashScriptCommand(script) {
   const encoded = Buffer.from(String(script), 'utf8').toString('base64')
@@ -187,7 +217,7 @@ function shellQuote(value) {
   return "'" + String(value == null ? '' : value).replace(/'/g, "'\\''") + "'"
 }
 
-/** 探测一个发行版：dsh 在不在、什么版本、有哪些 profile。 */
+/** 探测一个发行版：dsh 在不在、什么版本、有哪些 profile、systemd 能不能用。 */
 export async function inspectWslDistro(distro, home, options = {}) {
   const wantedHome = home || DEFAULT_HOME
   const wantedCommand = options.dshCommand || 'dsh'
@@ -216,10 +246,16 @@ export async function inspectWslDistro(distro, home, options = {}) {
     'fi',
     'printf \'__DSHX_PROFILES__\\n\'',
     'if [ -d "$home/profiles" ]; then ls -1 "$home/profiles" 2>/dev/null; fi',
+    'if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user show-environment >/dev/null 2>&1; then',
+    '  printf \'__DSHX_SYSTEMD__1\\n\'',
+    'else',
+    '  printf \'__DSHX_SYSTEMD__0\\n\'',
+    'fi',
+    'printf \'__DSHX_LINGER__%s\\n\' "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null || echo unknown)"',
   ].join('\n')
   const result = await runBashScript(distro, command, { timeoutMs: 20000 })
   const lines = String(result.stdout || '').split(/\r?\n/)
-  const info = { ok: false, distro: distro, home: '', dshHome: '', dshCommand: '', dshPath: '', version: '', profiles: [], missing: false, error: '', raw: '' }
+  const info = { ok: false, distro: distro, home: '', dshHome: '', dshCommand: '', dshPath: '', version: '', profiles: [], systemd: false, linger: '', missing: false, error: '', raw: '' }
   let inProfiles = false
   for (const line of lines) {
     if (line.indexOf('__DSHX_HOME__') === 0) info.home = line.slice('__DSHX_HOME__'.length)
@@ -228,6 +264,8 @@ export async function inspectWslDistro(distro, home, options = {}) {
     else if (line.indexOf('__DSHX_DSH_PATH__') === 0) info.dshPath = line.slice('__DSHX_DSH_PATH__'.length)
     else if (line.indexOf('__DSHX_VERSION__') === 0) info.version = line.slice('__DSHX_VERSION__'.length).trim()
     else if (line === '__DSHX_MISSING__1') info.missing = true
+    else if (line === '__DSHX_SYSTEMD__1') info.systemd = true
+    else if (line.indexOf('__DSHX_LINGER__') === 0) info.linger = line.slice('__DSHX_LINGER__'.length).trim()
     else if (line === '__DSHX_PROFILES__') inProfiles = true
     else if (inProfiles && line.trim()) info.profiles.push(line.trim())
   }
@@ -236,6 +274,7 @@ export async function inspectWslDistro(distro, home, options = {}) {
   else if (info.missing) info.error = 'WSL 里找不到 ' + (info.dshCommand || 'dsh') + '，先在该发行版里安装 dsh'
   else info.ok = Boolean(info.version)
   inspectCache.set(key, { at: Date.now(), value: info })
+  systemdCache.set(distro, { at: Date.now(), value: info.systemd })
   return info
 }
 
@@ -283,9 +322,22 @@ export function buildAgentInstallScript(text = WSL_AGENT_SCRIPT, name = 'dsh-x-w
   ].join('\n')
 }
 
+/** systemd user 会话是否可用（不只看目录，避免 systemctl 在容器式发行版里空转）。 */
+export async function systemdAvailable(distro, options = {}) {
+  if (!distro) return false
+  const cached = systemdCache.get(distro)
+  if (!options.force && cached && Date.now() - cached.at < 30000) return cached.value
+  const info = await inspectWslDistro(distro, options.home || DEFAULT_HOME, { force: true, dshCommand: options.dshCommand || 'dsh' })
+  return Boolean(info && info.systemd)
+}
+
 async function installAgentScript(distro) {
-  const result = await wslBash(distro, buildAgentInstallScript(), { timeoutMs: 20000 })
-  if (!result.ok) throw new Error('写入 WSL 启动脚本失败：' + (result.stderr.trim() || result.stdout.trim() || '未知错误'))
+  // 一个文件一条 wsl.exe 命令：脚本本身不大，但内容还会被 runBashScript 再 base64 一次；
+  // 两份拼在一条命令行里有撞 Windows 32K 参数上限的风险，分开写更稳。
+  for (const [name, text] of [['dsh-x-wsl.sh', WSL_AGENT_SCRIPT], ['dsh-x-systemd.sh', WSL_SYSTEMD_SCRIPT]]) {
+    const result = await wslBash(distro, buildAgentInstallScript(text, name), { timeoutMs: 20000 })
+    if (!result.ok) throw new Error('写入 WSL 启动脚本失败：' + (result.stderr.trim() || result.stdout.trim() || '未知错误'))
+  }
 }
 
 export function wslHomeKey(distro, home) {
@@ -343,17 +395,85 @@ export async function allocateWslPort(distro, preferred, windowsFree) {
   throw new Error('WSL 里没有找到可用端口')
 }
 
-/** 启动一个 WSL 实例；返回的 child 就是 wsl.exe，stdout/stderr 由 attachProcess 读。 */
+function windowsPortOpen(port, timeoutMs = 500) {
+  return new Promise((resolve) => {
+    let settled = false
+    let socket
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      try { socket?.destroy() } catch { /* 已关闭 */ }
+      resolve(value)
+    }
+    try {
+      socket = net.connect({ host: '127.0.0.1', port: port })
+      socket.setTimeout(timeoutMs)
+      socket.once('connect', () => finish(true))
+      socket.once('timeout', () => finish(false))
+      socket.once('error', () => finish(false))
+    } catch {
+      finish(false)
+    }
+  })
+}
+
+/** 查 WSL 侧端口的主人：ss 能给出 PID 和命令行，用来区分 dsh 与别的服务。 */
+export async function probeWslDshPort(distro, port) {
+  const script = [
+    'port=' + shellQuote(String(port)),
+    'if command -v ss >/dev/null 2>&1; then',
+    '  out=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)',
+    '  if [ -n "$out" ]; then',
+    '    echo "__DSHX_LISTEN__1"',
+    '    pid=$(printf \'%s\' "$out" | grep -o \'pid=[0-9]*\' | head -n 1 | cut -d= -f2)',
+    '    if [ -n "$pid" ]; then',
+    '      echo "__DSHX_PID__$pid"',
+    '      ps -p "$pid" -o args= 2>/dev/null | sed \'s/^/__DSHX_CMD__/\' || true',
+    '    fi',
+    '  else',
+    '    echo "__DSHX_LISTEN__0"',
+    '  fi',
+    'else',
+    '  if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then echo "__DSHX_LISTEN__1"; else echo "__DSHX_LISTEN__0"; fi',
+    'fi',
+  ].join('\n')
+  const result = await runBashScript(distro, script, { timeoutMs: 5000 })
+  const info = { port: Number(port) || 0, wslListening: false, listening: false, dsh: false, pid: 0, command: '', raw: String(result.stdout || '') }
+  for (const line of String(result.stdout || '').split(/\r?\n/)) {
+    if (line === '__DSHX_LISTEN__1') info.wslListening = true
+    else if (line.indexOf('__DSHX_PID__') === 0) info.pid = Number(line.slice('__DSHX_PID__'.length)) || 0
+    else if (line.indexOf('__DSHX_CMD__') === 0) info.command = line.slice('__DSHX_CMD__'.length).trim()
+  }
+  info.dsh = /(?:^|[\s/])dsh(?:\s|$)|@deepseek-ai\/dsh|dsh\s+web/.test(info.command)
+  info.listening = await windowsPortOpen(info.port)
+  return info
+}
+
+/** 启动一个 WSL 实例；返回的 child 就是 wsl.exe（wrapper）或 journal 跟随器（systemd）。 */
 export async function startWslInstance(options) {
   const distro = options.distro
-  const serviceMode = options.serviceMode || WSL_SERVICE_MODE
-  if (serviceMode !== WSL_SERVICE_MODE) throw new Error('暂不支持 WSL 服务模式：' + serviceMode)
+  let serviceMode = normalizeWslServiceMode(options.serviceMode)
+  let fallbackFromSystemd = false
+  if (serviceMode === 'systemd' && !(await systemdAvailable(distro, { dshCommand: options.dshCommand }))) {
+    serviceMode = 'wrapper'
+    fallbackFromSystemd = true
+  }
   await installAgentScript(distro)
   const instanceId = randomBytes(8).toString('hex')
-  // 所有启动参数都拼进脚本文本：wsl.exe 不把 argv 尾部原样交给 bash（见 shellQuote）。
+  const port = Number(options.port) || 0
+  if (serviceMode === 'systemd') {
+    try {
+      const started = await startSystemdInstance({ ...options, distro, instanceId, port })
+      return { ...started, serviceMode, fallbackFromSystemd }
+    } catch (error) {
+      // unit 可能已经起来了，但 journal 跟随器没拉起来；这时直接把 unit 停掉，免得留下孤儿服务。
+      await stopWslInstance({ distro, instanceId, port, serviceMode: 'systemd' }).catch(() => {})
+      throw error
+    }
+  }
   const script = 'script="$HOME/.dsh-x/bin/dsh-x-wsl.sh"\nexec "$script" start ' + [
     instanceId, options.profile, options.home || DEFAULT_HOME,
-    options.workdir || '', String(options.port), options.dshCommand || 'dsh',
+    options.workdir || '', String(port), options.dshCommand || 'dsh',
   ].map(shellQuote).join(' ')
   const args = ['-d', distro, '--', 'bash', '-lc', bashScriptCommand(script)]
   let child
@@ -362,15 +482,79 @@ export async function startWslInstance(options) {
   } catch (error) {
     throw new Error('启动 wsl.exe 失败：' + (error instanceof Error ? error.message : String(error)))
   }
-  return { child: child, instanceId: instanceId, distro: distro, port: options.port, serviceMode: serviceMode, home: options.home || DEFAULT_HOME, workdir: options.workdir || '' }
+  return { child: child, instanceId: instanceId, distro: distro, port: port, serviceMode: serviceMode, home: options.home || DEFAULT_HOME, workdir: options.workdir || '', fallbackFromSystemd }
 }
 
-/** 停一个 WSL 实例：先让 Linux 侧按 pidfile 收尸，再由调用方杀 wsl.exe 门。 */
+/** systemd 模式：unit 托管 dsh，另起一个 wsl.exe 跟随 journal 作为 attachProcess 的 stdout 来源。 */
+async function startSystemdInstance(options) {
+  const { distro, instanceId, port } = options
+  const command = 'script="$HOME/.dsh-x/bin/dsh-x-systemd.sh"\nexec "$script" start ' + [
+    instanceId, options.profile, options.home || DEFAULT_HOME, options.workdir || '', String(port), options.dshCommand || 'dsh',
+  ].map(shellQuote).join(' ')
+  const result = await runBashScript(distro, command, { timeoutMs: 30000 })
+  if (!result.ok) {
+    throw new Error('启动 systemd 服务失败：' + (result.stderr.trim() || result.stdout.trim() || '未知错误'))
+  }
+  // unit 的唯一 id 保证 journal 里只有这一次实例的日志；-n +1 从本次 unit 的第一行开始跟。
+  const journalScript = 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"; exec journalctl --user -u ' + shellQuote('dsh-x-' + instanceId + '.service') + ' -n 100 -f -o cat'
+  let child
+  try {
+    child = spawn(WSL_EXE, ['-d', distro, '--', 'bash', '-lc', bashScriptCommand(journalScript)], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  } catch (error) {
+    throw new Error('跟随 WSL systemd 日志失败：' + (error instanceof Error ? error.message : String(error)))
+  }
+  // systemd 模式下的 wsl.exe 都是短命调用；必须留一个长期进程，否则 WSL VM 可能休眠把 unit 一起冻住。
+  let keepalive = null
+  try {
+    keepalive = spawn(WSL_EXE, ['-d', distro, '--', 'bash', '-lc', 'exec sleep infinity'], { stdio: 'ignore', windowsHide: true })
+  } catch { /* 没有 keepalive 也能跑，只是 VM 空闲策略可能影响 unit */ }
+  return { child, instanceId, distro, port, home: options.home || DEFAULT_HOME, workdir: options.workdir || '', keepalive }
+}
+
+/** 停一个 WSL 实例：先让 Linux 侧按 pidfile / unit 收尸，再由调用方杀 wsl.exe 门。 */
 export async function stopWslInstance(options) {
   if (!options.distro || !options.instanceId) return { ok: true, skipped: true }
-  const command = 'script="$HOME/.dsh-x/bin/dsh-x-wsl.sh"; if [ -x "$script" ]; then exec "$script" stop ' + shellQuote(options.instanceId) + ' ' + shellQuote(String(options.port || '')) + '; fi'
-  const result = await runBashScript(options.distro, command, { timeoutMs: 20000 })
+  const serviceMode = normalizeWslServiceMode(options.serviceMode)
+  const scriptName = serviceMode === 'systemd' ? 'dsh-x-systemd.sh' : 'dsh-x-wsl.sh'
+  const command = 'script="$HOME/.dsh-x/bin/' + scriptName + '"; if [ -x "$script" ]; then exec "$script" stop ' + shellQuote(options.instanceId) + ' ' + shellQuote(String(options.port || '')) + '; fi'
+  let result
+  try {
+    result = await runBashScript(options.distro, command, { timeoutMs: 30000 })
+  } finally {
+    // 脚本本身超时/抛错时也要收掉 keepalive，否则 WSL VM 会被一个孤儿 sleep 一直吊着。
+    try { options.keepalive?.kill('SIGKILL') } catch { /* 已退出 */ }
+  }
   return { ok: result.ok, stderr: result.stderr, stdout: result.stdout }
+}
+
+/** 停止不是本管理器拉起的 dsh：只在 stopAttached 打开时调用，按端口找到 PID 再 TERM。 */
+export async function stopWslExternal(options) {
+  if (!options.distro || !options.port) return { ok: false, skipped: true }
+  const script = [
+    'port=' + shellQuote(String(options.port)),
+    'if ! command -v ss >/dev/null 2>&1; then exit 1; fi',
+    'out=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)',
+    'pid=$(printf \'%s\' "$out" | grep -o \'pid=[0-9]*\' | head -n 1 | cut -d= -f2)',
+    'if [ -z "$pid" ]; then exit 0; fi',
+    'cmd=$(ps -p "$pid" -o args= 2>/dev/null || true)',
+    '# 端口会被别的服务复用，先确认进程命令行确实是 dsh 且带这个端口（或 dsh web）；',
+    '# 只匹配 *dsh* 会把名字里带 dsh 的无关进程一起杀掉。',
+    'case "$cmd" in',
+    '  *dsh*"--port $port"*|*dsh*"--port=$port"*) ;;',
+    '  *dsh*" web"*) ;;',
+    '  *) exit 3 ;;',
+    'esac',
+    'kill -TERM "$pid" 2>/dev/null || true',
+    'i=0',
+    'while [ "$i" -lt 50 ]; do',
+    '  kill -0 "$pid" 2>/dev/null || exit 0',
+    '  sleep 0.1',
+    '  i=$((i + 1))',
+    'done',
+    'kill -KILL "$pid" 2>/dev/null || true',
+  ].join('\n')
+  const result = await runBashScript(options.distro, script, { timeoutMs: 10000 })
+  return { ok: result.ok, stdout: result.stdout, stderr: result.stderr }
 }
 
 export { WSL_EXE, DEFAULT_HOME }
