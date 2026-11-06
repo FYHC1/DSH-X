@@ -812,6 +812,14 @@
               <label for="launchWslDistro" data-i18n="WSL 发行版">WSL 发行版</label>
               <select id="launchWslDistro"></select>
             </div>
+            <div class="home-field">
+              <label for="launchWslVersion" data-i18n="WSL 里的 dsh 版本">WSL 里的 dsh 版本</label>
+              <div class="launch-version-select-row">
+                <select id="launchWslVersion"></select>
+                <button class="ghost icon-btn launch-manage-version" id="launchWslManageVersions" type="button" title="管理 WSL 版本" aria-label="管理 WSL 版本" data-i18n-title="管理 WSL 版本" data-i18n-aria-label="管理 WSL 版本"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></button>
+              </div>
+              <p class="hint" id="launchWslVersionHint"></p>
+            </div>
             <p class="hint" id="launchWslHint" role="status" aria-live="polite"></p>
           </div>
         </div>
@@ -1088,7 +1096,20 @@
   "WSL 里没有可用的 dsh。": "No usable dsh inside WSL.",
   "{n} 个 Profile": "{n} profiles",
   "WSL 里要已经装好 dsh；首版只管理启动、停止、日志和打开方式。": "dsh must already be installed inside WSL; the first version only manages start, stop, logs and how to open.",
+  "WSL 里可以用发行版自带的 dsh，也可以由启动器安装并管理其他版本。": "Use the distro's own dsh, or install and manage other versions with the launcher.",
   "WSL 里的 dsh": "dsh in WSL",
+  "WSL 里的 dsh 版本": "dsh version in WSL",
+  "管理 WSL 版本": "Manage WSL versions",
+  "WSL 版本管理": "WSL version manager",
+  "跟随 WSL 自带的 dsh": "Use the distro's own dsh",
+  "跟随 WSL 自带的 dsh（{version}）": "Use the distro's own dsh ({version})",
+  "正在读取 WSL 里的版本…": "Reading versions inside WSL…",
+  "已安装 {n} 个由启动器管理的版本。": "{n} launcher-managed versions installed.",
+  "还没有在 WSL 里安装托管版本。": "No launcher-managed versions installed in WSL yet.",
+  "WSL 自带的 dsh": "Distro's own dsh",
+  "版本装在 WSL 的 {distro} 里，数据留在 {home}。": "Versions live in WSL distro {distro}; your data stays in {home}.",
+  "卸载 WSL 里的 {version}？插件和数据会保留。": "Uninstall {version} from WSL? Plugins and data are kept.",
+  "使用 WSL 里选中的 dsh 版本；可以在编辑启动项里安装和管理。": "Use the dsh version selected for WSL; install and manage it while editing the launch entry.",
   "使用 WSL 里已经装好的 dsh；首版不在这里安装或更新版本。": "Use the dsh already installed in WSL; the first version does not install or update versions here.",
   "自动选择": "Auto",
   "检测到 {n} 个发行版；启动项里可以逐个选。": "{n} distros detected; pick one per launch entry.",
@@ -2117,6 +2138,9 @@
     const launchWslDistroEl = document.getElementById('launchWslDistro')
     const launchWslHomeEl = document.getElementById('launchWslHome')
     const launchWslWorkdirEl = document.getElementById('launchWslWorkdir')
+    const launchWslVersionEl = document.getElementById('launchWslVersion')
+    const launchWslVersionHintEl = document.getElementById('launchWslVersionHint')
+    const launchWslManageVersionsEl = document.getElementById('launchWslManageVersions')
     const launchWslHintEl = document.getElementById('launchWslHint')
     const launchPortEl = document.getElementById('launchPort')
     const launchAutoLaunchEl = document.getElementById('launchAutoLaunch')
@@ -2165,6 +2189,7 @@
     const launchLogPluginsEl = document.getElementById('launchLogPlugins')
     const manageVersionsEl = document.getElementById('launchManageVersions')
     const versionInstallSelectEl = document.getElementById('versionInstallSelect')
+    const versionManageTitleEl = document.getElementById('versionManageTitle')
     const launchFormEl = document.getElementById('launchForm')
     const launchAddEl = document.getElementById('launchAdd')
     const launchDeleteEl = document.getElementById('launchDelete')
@@ -2540,6 +2565,10 @@
     let launchBackend = 'local'      // 'local' | 'wsl'：启动项跑在哪一侧
     let launchWslProfiles = []       // 当前 WSL 发行版探测到的 profile（WSL 分支专用）
     let launchWslInspectKey = ''     // distro\0home，避免旧探针结果盖住新选择
+    let wslVersionInfo = null        // /api/wsl/versions 的结果：托管版本 + 发行版自带 dsh
+    let wslVersionInfoKey = ''       // distro\0home，切换目标时旧列表必须作废
+    let wslVersionCheck = { busy: false, message: '', error: '' }
+    let wslInstallProgress = null    // WSL 版本安装进度（独立于本机 installProgress）
     let editingLaunchId = ''
     let action = ''
     let installProgress = null
@@ -3848,10 +3877,10 @@
       }
     }
 
-    function progressHint(prefix) {
-      const total = Number(installProgress?.total) || 0
-      const done = Number(installProgress?.done) || 0
-      const phase = installProgress?.phase
+    function progressHint(prefix, progress = installProgress) {
+      const total = Number(progress?.total) || 0
+      const done = Number(progress?.done) || 0
+      const phase = progress?.phase
       if (phase === 'resolve') {
         return done ? t('{prefix}… 已解析 {done} 个依赖', { prefix, done }) : `${prefix}…`
       }
@@ -4064,6 +4093,70 @@
       launchWslDistroEl.value = distros.some((item) => item.name === current) ? current : fallback
     }
 
+    /** WSL 版本下拉：空值表示跟随发行版自带的 dsh，非空才是启动器在 ~/.dsh-x/versions 里管的版本。 */
+    function paintLaunchWslVersions(selected) {
+      if (typeof launchWslVersionEl === 'undefined' || !launchWslVersionEl) return
+      const key = `${launchWslDistroEl.value}\0${launchWslHomeEl.value.trim()}`
+      const info = wslVersionInfoKey === key ? wslVersionInfo : null
+      const managed = Array.isArray(info?.versions) ? info.versions : []
+      const system = info?.system?.version || ''
+      const current = typeof selected === 'string' ? selected : launchWslVersionEl.value
+      const first = system
+        ? t('跟随 WSL 自带的 dsh（{version}）', { version: system })
+        : t('跟随 WSL 自带的 dsh')
+      launchWslVersionEl.innerHTML = [`<option value="">${escapeHtml(first)}</option>`]
+        .concat(managed.map((version) => `<option value="${escapeHtml(version)}">${escapeHtml(version)}</option>`))
+        .join('')
+      launchWslVersionEl.value = managed.includes(current) ? current : ''
+      if (typeof launchWslVersionHintEl === 'undefined' || !launchWslVersionHintEl) return
+      launchWslVersionHintEl.textContent = wslVersionCheck.error ? wslVersionCheck.error
+        : wslVersionCheck.busy ? t('正在读取 WSL 里的版本…')
+        : managed.length ? t('已安装 {n} 个由启动器管理的版本。', { n: managed.length })
+        : t('还没有在 WSL 里安装托管版本。')
+    }
+
+    /**
+     * 读取 WSL 版本列表。编辑器里的版本下拉和版本管理弹窗共用这一份结果；
+     * key 防竞态，连续改发行版/目录时旧请求的结果不能盖住新选择。
+     */
+    async function loadWslVersions(selected) {
+      if (typeof launchWslVersionEl === 'undefined' || !launchWslVersionEl) return null
+      const distro = launchWslDistroEl.value
+      const home = launchWslHomeEl.value.trim()
+      const key = `${distro}\0${home}`
+      wslVersionInfoKey = key
+      if (!distro) {
+        wslVersionInfo = null
+        wslVersionCheck = { busy: false, message: '', error: '' }
+        paintLaunchWslVersions('')
+        return null
+      }
+      wslVersionCheck = { busy: true, message: '', error: '' }
+      paintLaunchWslVersions(typeof selected === 'string' ? selected : undefined)
+      try {
+        const data = await getJson(`/api/wsl/versions?distro=${encodeURIComponent(distro)}&home=${encodeURIComponent(home)}`)
+        if (wslVersionInfoKey !== key) return null
+        wslVersionInfo = data
+        wslVersionCheck = { busy: false, message: '', error: '' }
+        paintLaunchWslVersions(typeof selected === 'string' ? selected : undefined)
+        return data
+      } catch (error) {
+        if (wslVersionInfoKey === key) {
+          wslVersionInfo = null
+          wslVersionCheck = { busy: false, message: '', error: error.message }
+          paintLaunchWslVersions('')
+        }
+        return null
+      }
+    }
+
+    /** 切发行版/目录/版本后重新探测：版本列表先定下来，profile 列表再按选中的 dsh 探。 */
+    async function refreshWslVersions(selected) {
+      const data = await loadWslVersions(selected)
+      await refreshWslProfiles(true)
+      return data
+    }
+
     /**
      * 探测 WSL 里的 dsh：版本、dsh 路径、profile 列表都从那边读，页面不猜。
      * 探针带 key 防竞态：用户连续换发行版/目录时，旧请求的结果不能盖住新选择。
@@ -4071,7 +4164,8 @@
     async function refreshWslProfiles(resetMissing = false) {
       const distro = launchWslDistroEl.value
       const home = launchWslHomeEl.value.trim()
-      const key = `${distro}\0${home}`
+      const version = typeof launchWslVersionEl !== 'undefined' && launchWslVersionEl ? launchWslVersionEl.value : ''
+      const key = `${distro}\0${home}\0${version}`
       launchWslInspectKey = key
       if (!distro) {
         launchWslProfiles = []
@@ -4081,7 +4175,7 @@
       }
       launchWslHintEl.textContent = t('正在读取 WSL 里的 dsh…')
       try {
-        const data = await getJson(`/api/wsl?distro=${encodeURIComponent(distro)}&home=${encodeURIComponent(home)}`)
+        const data = await getJson(`/api/wsl?distro=${encodeURIComponent(distro)}&home=${encodeURIComponent(home)}&version=${encodeURIComponent(version)}`)
         if (launchWslInspectKey !== key) return false
         state.wsl = {
           ...(state.wsl || {}),
@@ -4145,8 +4239,8 @@
         paintLaunchWslDistros(entry?.wslDistro || '')
         launchWslHomeEl.value = entry?.wslHome || ''
         launchWslWorkdirEl.value = entry?.wslWorkdir || ''
-        launchBackendHintEl.textContent = t('WSL 里要已经装好 dsh；首版只管理启动、停止、日志和打开方式。')
-        void refreshWslProfiles(true)
+        launchBackendHintEl.textContent = t('WSL 里可以用发行版自带的 dsh，也可以由启动器安装并管理其他版本。')
+        void refreshWslVersions(entry?.wslVersion || '')
       } else {
         launchBackendHintEl.textContent = ''
         paintLaunchProfiles()
@@ -4160,8 +4254,9 @@
         if (button.dataset.backend === launchBackend) return
         setLaunchBackend(button.dataset.backend)
       }
-      launchWslDistroEl.onchange = () => { launchWslProfiles = []; void refreshWslProfiles(true) }
-      launchWslHomeEl.onchange = () => { launchWslProfiles = []; void refreshWslProfiles(true) }
+      launchWslDistroEl.onchange = () => { launchWslProfiles = []; void refreshWslVersions('') }
+      launchWslHomeEl.onchange = () => { launchWslProfiles = []; void refreshWslVersions('') }
+      if (typeof launchWslVersionEl !== 'undefined' && launchWslVersionEl) launchWslVersionEl.onchange = () => { void refreshWslProfiles(true) }
     }
     async function refreshLaunchHomeProfiles(resetMissing = false) {
       if (launchBackendIsWsl()) return refreshWslProfiles(resetMissing)
@@ -5143,7 +5238,7 @@
           ? [shownVersion || t('WSL 里的 dsh'), entry.profile, `WSL · ${entry.wslDistro || launchWslDistroOf(entry)}`].filter(Boolean).join(' · ')
           : [version || t('自动选择版本'), entry.profile, entry.dshHome].filter(Boolean).join(' · ')
         // 状态不占文字：启动/停止/安装中的反馈由按钮上的转圈表示，运行中由停止按钮表示
-        const automaticHint = wsl ? t('使用 WSL 里已经装好的 dsh；首版不在这里安装或更新版本。')
+        const automaticHint = wsl ? t('使用 WSL 里选中的 dsh 版本；可以在编辑启动项里安装和管理。')
           : entry.version === 'auto' ? t('优先使用正在运行的版本，否则选择本机最新已安装版本；只用所选版本类型的版本，未安装时会在首次启动下载该类型的最新版。新版本需要手动更新。') : ''
         const latest = launchLatestVersion(entry)
         // 「新版本」只给 auto 条目看：钉死版本的启动项是故意留的，冒一个更新按钮出来
@@ -5287,6 +5382,7 @@
     let launchDialogClosing = false
 
     let versionManageReturnToEditor = false
+    let versionManageWsl = false
     let versionManageOrigin = null
     let versionManageRevision = 0
     let versionManageMarkup = ''
@@ -5297,6 +5393,9 @@
       ++versionManageRevision
       versionManageOrigin = document.activeElement
       versionManageReturnToEditor = !launchDialogEl.hidden
+      versionManageWsl = versionManageReturnToEditor && typeof launchBackendIsWsl === 'function' && launchBackendIsWsl()
+      versionManageMarkup = ''
+      versionInstallOptions = ''
       closeVersionPanel()
       closeUiSelect()
       if (versionManageReturnToEditor) {
@@ -5304,12 +5403,17 @@
         launchDialogEl.classList.add('is-underlay')
       }
       versionManageDialogEl.classList.toggle('is-child-dialog', versionManageReturnToEditor)
+      if (versionManageTitleEl) {
+        versionManageTitleEl.dataset.i18n = versionManageWsl ? 'WSL 版本管理' : '版本管理'
+        versionManageTitleEl.textContent = t(versionManageTitleEl.dataset.i18n)
+      }
       paintVersionManager()
       showDialog(versionManageDialogEl)
       document.getElementById('versionManageClose').focus()
       // 打开就顺手静默刷新一次远程列表（服务端 60 秒内走缓存，不会每次都打网络）：
       // 新版本在版本管理里就能看到，不用等到下次重启。
       void checkVersions({ force: false, quiet: true })
+      if (versionManageWsl) void loadWslVersions().then(() => paintVersionManager())
     }
 
     async function closeVersionManager() {
@@ -5321,6 +5425,7 @@
       versionManageDialogEl.classList.remove('is-child-dialog')
       if (versionManageReturnToEditor) launchFormEl.inert = false
       versionManageReturnToEditor = false
+      versionManageWsl = false
       const origin = versionManageOrigin
       versionManageOrigin = null
       if (origin?.isConnected) origin.focus({ preventScroll: true })
@@ -5364,6 +5469,8 @@
      * 「已是最新」这种每次都出现的废话，只有真发现新版本才留一句话。
      */
     async function checkVersions({ force = true, quiet = false } = {}) {
+      // WSL 版本管理里这次点击还要刷新 WSL 里已装的版本清单：那边装完 npm 包不会自动重建下拉。
+      if (typeof versionManageWsl !== 'undefined' && versionManageWsl && typeof loadWslVersions === 'function') void loadWslVersions().then(() => { if (versionManageWsl) paintVersionManager() }).catch(() => {})
       // 强制检测正在跑时让静默刷新让路：按钮那次的反馈和结果更完整
       if (quiet && versionCheck.busy) return
       const seq = ++versionCheckSeq
@@ -5395,6 +5502,7 @@
     }
 
     async function manualInstallVersion(version) {
+      if (typeof versionManageWsl !== 'undefined' && versionManageWsl) return manualInstallWslVersion(version)
       if (!version || action || state.installing || installedList().includes(version)) return
       // 手动安装只增添运行时，不停实例、不启动页面，也不改启动项版本或编辑器草稿。
       action = 'install'
@@ -5403,6 +5511,20 @@
       render()
       try {
         await post('/api/install', { version })
+        applyState(await getJson('/api/state'))
+      } catch (error) { notify(error.message) }
+      finally { action = ''; render() }
+    }
+
+    /** WSL 版本安装：走 /api/wsl/install，进度由 wslProgress 单独驱动，不占用本机安装状态。 */
+    async function manualInstallWslVersion(version) {
+      if (!version || action || wslVersionCheck.busy || wslInstallProgress || !launchBackendIsWsl()) return
+      action = 'install'
+      resetVersionCheck()
+      render()
+      try {
+        await post('/api/wsl/install', { version, distro: launchWslDistroEl.value, home: launchWslHomeEl.value.trim() })
+        await loadWslVersions()
         applyState(await getJson('/api/state'))
       } catch (error) { notify(error.message) }
       finally { action = ''; render() }
@@ -5421,7 +5543,62 @@
       finally { action = ''; render() }
     }
 
+    /** WSL 版本管理：只列托管版本和发行版自带 dsh，不出现本机的优化依赖按钮。 */
+    function paintWslVersionManager() {
+      const installed = (Array.isArray(wslVersionInfo?.versions) ? [...wslVersionInfo.versions] : []).sort((a, b) => compareVersion(b, a))
+      const latest = latestRemoteVersion()
+      const available = [...new Set([latest, ...allVersionList()])].filter((version) => version && !installed.includes(version))
+        .sort((a, b) => compareVersion(b, a))
+      const previous = versionInstallSelectEl.value
+      const options = available.map((version) => `<option value="${escapeHtml(version)}">${escapeHtml(version)}${version === latest ? ` · ${escapeHtml(t('最新'))}` : ''}</option>`).join('')
+        || `<option value="">${escapeHtml(t('没有可安装的版本'))}</option>`
+      if (versionInstallOptions !== options) {
+        versionInstallOptions = options
+        versionInstallSelectEl.innerHTML = options
+        versionInstallSelectEl.value = available.includes(previous) ? previous : (available.includes(latest) ? latest : available[0] || '')
+      }
+      const checkButton = document.getElementById('versionManageCheck')
+      const checking = versionCheck.busy || wslVersionCheck.busy
+      const busy = Boolean(action) || checking || Boolean(wslInstallProgress)
+      versionInstallSelectEl.disabled = busy || !available.length
+      document.getElementById('versionManageInstall').disabled = busy || !versionInstallSelectEl.value
+      checkButton.disabled = busy
+      checkButton.classList.toggle('loading', checking)
+      checkButton.setAttribute('aria-busy', checking ? 'true' : 'false')
+      syncUiSelect(versionInstallSelectEl)
+      const installing = Boolean(wslInstallProgress) || action === 'install' || action === 'uninstall'
+      const checkNote = wslVersionCheck.message || versionCheck.message
+      document.getElementById('versionManageHint').textContent = wslVersionCheck.error || versionCheck.error || checkNote
+        || (wslVersionCheck.busy || versionCheck.busy ? t('正在检测版本…')
+          : action === 'uninstall' ? t('正在卸载…')
+          : installing ? progressHint(t('正在安装'), wslInstallProgress)
+          : wslVersionInfo ? t('版本装在 WSL 的 {distro} 里，数据留在 {home}。', { distro: wslVersionInfo.distro || launchWslDistroEl.value, home: wslVersionInfo.home || launchWslHomeEl.value.trim() }) : '')
+      paintProgress(document.getElementById('versionManageProgress'), document.getElementById('versionManageProgressBar'), wslInstallProgress, installing)
+      const list = document.getElementById('versionManageList')
+      const system = wslVersionInfo?.system
+      const rows = []
+      if (system?.version) {
+        rows.push(`<div class="version-manage-row" role="listitem"><div class="version-manage-info"><strong>${escapeHtml(system.version)}</strong><span>${escapeHtml(t('WSL 自带的 dsh'))}</span></div></div>`)
+      }
+      rows.push(...installed.map((version) => {
+        const live = (state.instances || []).find((item) => item.backend === 'wsl' && item.version === version && ['running', 'starting', 'stopping'].includes(item.status))
+        const status = live ? live.status === 'starting' ? t('启动中') : live.status === 'stopping' ? t('停止中')
+          : t('正在运行 · {profile}', { profile: live.profile || t('运行中') }) : t('未运行')
+        const label = t('卸载版本')
+        return `<div class="version-manage-row" role="listitem"><div class="version-manage-info"><strong>${escapeHtml(version)}</strong>${live ? `<span title="${escapeHtml(status)}">${escapeHtml(status)}</span>` : ''}</div><button class="ghost icon-btn version-remove" type="button" data-remove-version="${escapeHtml(version)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}" ${busy || live ? 'disabled' : ''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7"/></svg></button></div>`
+      }))
+      const markup = rows.join('') || `<p class="hint version-manage-empty">${escapeHtml(t('还没有在 WSL 里安装托管版本。'))}</p>`
+      if (versionManageMarkup !== markup) {
+        versionManageMarkup = markup
+        list.innerHTML = markup
+        list.querySelectorAll('[data-remove-version]').forEach((button) => {
+          button.onclick = () => { void uninstallVersion(button.dataset.removeVersion) }
+        })
+      }
+    }
+
     function paintVersionManager() {
+      if (typeof versionManageWsl !== 'undefined' && versionManageWsl) { paintWslVersionManager(); return }
       const installed = [...installedList()].sort((a, b) => compareVersion(b, a))
       const latest = latestRemoteVersion()
       const available = [...new Set([latest, ...allVersionList()])].filter((version) => version && !installed.includes(version))
@@ -5474,6 +5651,7 @@
     }
 
     manageVersionsEl.onclick = openVersionManager
+    if (typeof launchWslManageVersionsEl !== 'undefined' && launchWslManageVersionsEl) launchWslManageVersionsEl.onclick = openVersionManager
     document.getElementById('versionManageClose').onclick = closeVersionManager
     document.getElementById('versionManageCheck').onclick = () => { void checkVersions({ force: true }) }
     document.getElementById('versionInstallForm').onsubmit = (event) => {
@@ -5492,6 +5670,7 @@
     }
 
     async function uninstallVersion(version) {
+      if (typeof versionManageWsl !== 'undefined' && versionManageWsl) return uninstallWslVersionDialog(version)
       if (!version || action || state.installing || runningInfo(version)) return
       const system = !isManagedVersion(version)
       const ok = await appConfirm(system
@@ -5506,6 +5685,24 @@
         applyState(await getJson('/api/state'))
       }
       catch (error) { notify(error.message) }
+      finally { action = ''; render() }
+    }
+
+    /** 卸载 WSL 托管版本：运行中的实例先挡住，和本机卸载的口径一致。 */
+    async function uninstallWslVersionDialog(version) {
+      if (!version || action || wslInstallProgress) return
+      const live = (state.instances || []).find((item) => item.backend === 'wsl' && item.version === version && ['running', 'starting', 'stopping'].includes(item.status))
+      if (live) return
+      const ok = await appConfirm(t('卸载 WSL 里的 {version}？插件和数据会保留。', { version }))
+      if (!ok) return
+      action = 'uninstall'
+      resetVersionCheck()
+      render()
+      try {
+        await post('/api/wsl/uninstall', { version, distro: launchWslDistroEl.value, home: launchWslHomeEl.value.trim() })
+        await loadWslVersions()
+        applyState(await getJson('/api/state'))
+      } catch (error) { notify(error.message) }
       finally { action = ''; render() }
     }
 
@@ -5606,6 +5803,7 @@
             version: 'auto', profile: launchProfile, port: launchPortEl.value.trim(),
             backend: 'wsl', wslDistro: launchWslDistroEl.value,
             wslHome: launchWslHomeEl.value.trim(), wslWorkdir: launchWslWorkdirEl.value.trim(),
+            wslVersion: (typeof launchWslVersionEl !== 'undefined' && launchWslVersionEl ? launchWslVersionEl.value : '') || '',
             autoLaunch: launchAutoLaunchEl.checked,
           })
           updateLaunchEntry(data.entry)
@@ -6043,6 +6241,7 @@
       if (data.progress) installProgress = data.progress
       if (!data.installing) installProgress = data.progress || null
       if ('pluginProgress' in data) pluginProgress = data.pluginProgress || null
+      if ('wslProgress' in data) wslInstallProgress = data.wslProgress || null
       // 外观（主题、透明度、减少动效、背景）：设置页可能开在另一个标签页里，
       // 改完只有那一页自己变了；这里跟着状态推送同步，管窗口的这一页不用刷新。
       if (data.appearance && typeof data.appearance === 'object') fillSettings(data.appearance)
@@ -6098,6 +6297,11 @@
       events.addEventListener('progress', (event) => {
         try {
           const data = JSON.parse(event.data)
+          if (data?.kind === 'wsl') {
+            wslInstallProgress = !data || data.phase === 'idle' ? null : data
+            render()
+            return
+          }
           if (data?.kind === 'plugin') {
             pluginProgress = !data || data.phase === 'idle' ? null : data
             setPluginProgress(Boolean(pluginProgress))

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { WSL_AGENT_SCRIPT } from '../src/wsl-scripts.js'
+import { safeLaunchPresets } from '../src/settings.js'
 import {
   DEFAULT_HOME,
   WSL_SERVICE_MODE,
@@ -14,6 +15,7 @@ import {
   wslAvailable,
   wslHomeKey,
   buildAgentInstallScript,
+  wslManagedDshPath,
 } from '../src/wsl.js'
 
 // WSL 相关纯函数测试：不启动真实 wsl.exe，保证 macOS / Linux 开发机和 CI 也能跑。
@@ -113,4 +115,40 @@ test('bootWslOnce 在 finally 释放 rememberedWslPort 认领的自动端口', (
   const body = source.slice(start, end)
   assert.match(body, /const reused = remembered\.port/)
   assert.match(body, /finally \{\s*claimedAutoPorts\.delete\(reused\)\s*\}/)
+})
+
+
+test('WSL 托管版本在启动与重启路径里不会丢回系统 dsh', () => {
+  // 托管版本靠 startWslNow 解析成绝对路径；bootWslOnce 若不用 context.dshCommand，就会悄悄退回系统 dsh。
+  const source = readFileSync(new URL('../src/server.js', import.meta.url), 'utf8')
+  assert.match(source, /const pinnedWslVersion = String\(preset\?\.wslVersion \|\| launchScope\.getStore\(\)\?\.wslVersion \|\| ''\)\.trim\(\)/)
+  assert.match(source, /dshCommand: context\.dshCommand \|\| WSL_SETTINGS\.dshCommand \|\| 'dsh'/)
+  assert.match(source, /wslVersion: live\.wslVersion \|\| ''/)
+  assert.match(source, /wslVersion: proc\.wslVersion \|\| ''/)
+})
+
+test('WSL 托管版本路径按用户目录和版本拼装，空目录与非法版本直接报错', () => {
+  assert.equal(
+    wslManagedDshPath('/root/.dsh', '0.2.2'),
+    '/root/.dsh/.dsh-x/versions/0.2.2/node_modules/@deepseek-ai/dsh/lib/bin.js',
+  )
+  assert.equal(
+    wslManagedDshPath('/root/.dsh/', '0.2.2-rc.1'),
+    '/root/.dsh/.dsh-x/versions/0.2.2-rc.1/node_modules/@deepseek-ai/dsh/lib/bin.js',
+  )
+  assert.throws(() => wslManagedDshPath('', '0.2.2'), /用户目录为空/)
+  assert.throws(() => wslManagedDshPath('/root/.dsh', 'auto'), /非法的 WSL dsh 版本号/)
+  assert.throws(() => wslManagedDshPath('/root/.dsh', '../0.2.2'), /非法的 WSL dsh 版本号/)
+})
+
+test('启动项校验保留合法的 wslVersion，拒绝 auto 与路径式版本号', () => {
+  const base = {
+    id: '0123456789abcdef', name: 'WSL 测试', version: 'auto', profile: 'web', port: 0,
+    backend: 'wsl', wslDistro: 'Fedora', wslHome: '~/.dsh', wslVersion: '0.2.2',
+  }
+  const kept = safeLaunchPresets([base]).find((item) => item.id === base.id)
+  assert.equal(kept.backend, 'wsl')
+  assert.equal(kept.wslVersion, '0.2.2')
+  assert.equal(safeLaunchPresets([{ ...base, wslVersion: 'auto' }]).some((item) => item.id === base.id), false)
+  assert.equal(safeLaunchPresets([{ ...base, wslVersion: '../0.2.2' }]).some((item) => item.id === base.id), false)
 })

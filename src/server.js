@@ -134,7 +134,7 @@ import {
   saveSettings,
   VERSION_RE,
 } from './settings.js'
-import { allocateWslPort, inspectWslDistro, invalidateWslCache, listWslDistros, parseWslHomeKey, resolveWslHome, startWslInstance, stopWslInstance, wslAvailable, wslHomeKey, wslPortAvailable } from './wsl.js'
+import { allocateWslPort, inspectWslDistro, installWslVersion, invalidateWslCache, listWslDistros, listWslVersions, parseWslHomeKey, resolveWslHome, startWslInstance, stopWslInstance, uninstallWslVersion, wslAvailable, wslHomeKey, wslManagedDshPath, wslPortAvailable } from './wsl.js'
 // 带代理的 fetch：Node 的全局 fetch 既不看系统代理也不看 HTTP_PROXY，外网请求都走 netFetch
 import { netFetch, proxyEnv, resetProxyCache, resolveProxy } from './proxy.js'
 import { APP_DIR, fileManager } from './filemanager.js'
@@ -348,6 +348,10 @@ function instanceKey(version, profile) {
 let installing = null
 let optimizingVersion = null
 let installProgress = null
+// WSL 里的 dsh 版本安装与 Windows 侧完全独立：它走 WSL 内的 npm，进度也单独一条，
+// 不能塞进 installProgress，否则页面上的本机版本列表会误以为本机在装东西。
+let wslInstalling = ''
+let wslInstallProgress = null
 // 插件安装/升级的进度（走 dsh 内部的 pnpm，解析方式和 npm 不同，页面按 kind 分给不同的进度条）
 let pluginProgress = null
 let pluginProgressName = ''
@@ -1446,6 +1450,7 @@ async function snapshotDefault() {
     diagnosticRepairs: publicFailure({ message: '', diagnosis: diagnosticRepairs.history().map(record => ({ ...record, recorded: recordedChanges(record) })) }).diagnosis,
     dataDir: DATA,
     progress: installProgress,
+    wslProgress: wslInstallProgress,
     pluginProgress: pluginProgress ? { ...pluginProgress, name: pluginProgressName, profile: pluginProgressProfile } : null,
     sync: syncState,
     syncRunning,
@@ -1834,8 +1839,14 @@ async function saveLaunchPresetNow(body) {
   let wslDistro = ''
   let wslHome = ''
   let wslWorkdir = ''
+  let wslVersion = ''
   let home = ''
   let wslInfo = null
+  // 先读一次设置：编辑旧 WSL 启动项时，请求里没带的字段要能沿用原值（下面 wslVersion 要用）。
+  const stored = await loadSettings()
+  const previousWslEntry = backend === 'wsl' && body.id
+    ? safeLaunchPresets(stored.launchPresets).find((item) => item.id === String(body.id)) || null
+    : null
   if (backend === 'wsl') {
     // WSL 启动项：不碰 Windows 的 safeDshHome / safeWorkdir，也不在 Windows 侧建目录。
     // 发行版和用户目录都允许留空，留空时继承全局设置。
@@ -1843,8 +1854,19 @@ async function saveLaunchPresetNow(body) {
     if (!wslDistro) throw new Error('先选择一个 WSL 发行版')
     wslHome = safeWslPath(body.wslHome, 'WSL 用户目录') || WSL_SETTINGS.defaultHome
     wslWorkdir = safeWslPath(body.wslWorkdir, 'WSL 项目目录')
+    // 空的 wslVersion = 跟随 WSL 里系统安装的 dsh；非空 = 用 DSH-X 在 WSL 内装的那份。
+    wslVersion = String(body.wslVersion ?? '').trim()
+    // 旧页面/别的调用方不带这个字段时沿用原值，别在只改名字时把托管版本悄悄切回系统 dsh。
+    if (body.wslVersion === undefined && previousWslEntry?.backend === 'wsl') wslVersion = String(previousWslEntry.wslVersion || '').trim()
+    if (wslVersion === 'auto' || (wslVersion && !VERSION_RE.test(wslVersion))) throw new Error('WSL 版本号不合法')
     home = wslHomeKey(wslDistro, wslHome)
-    wslInfo = await inspectWslDistro(wslDistro, wslHome, { force: true, dshCommand: WSL_SETTINGS.dshCommand || 'dsh' })
+    let wslCommand = WSL_SETTINGS.dshCommand || 'dsh'
+    if (wslVersion) {
+      const managed = await listWslVersions(wslDistro, wslHome)
+      if (!managed.versions.includes(wslVersion)) throw new Error(`WSL 里没有安装 dsh ${wslVersion}，先在版本管理里安装`)
+      wslCommand = wslManagedDshPath(managed.home || wslHome, wslVersion)
+    }
+    wslInfo = await inspectWslDistro(wslDistro, wslHome, { force: true, dshCommand: wslCommand })
     if (!wslInfo.ok) throw new Error(wslInfo.error || `WSL 里的 dsh 不可用（${wslDistro}）`)
     if (!wslInfo.profiles.includes(profile) && !TEMPLATE_PROFILES.includes(profile)) throw new Error(`WSL 里没有 profile ${profile}，先在 WSL 里用 dsh 建一次`)
   } else {
@@ -1879,7 +1901,6 @@ async function saveLaunchPresetNow(body) {
   // 没带这个字段就沿用原来的通道（同 autoLaunch）：只改别的字段的调用方，比如「更新到新版」时
   // 把版本钉子挪过去，不该顺手把通道重置成正式版。坏值在动设置之前就报错。
   const requestedChannel = body.updateChannel === undefined ? undefined : safeUpdateChannel(body.updateChannel)
-  const stored = await loadSettings()
   if (installing || packInstalling) throw new Error('正在安装，稍后再编辑启动项')
   const presets = safeLaunchPresets(stored.launchPresets)
   const id = body.id ? String(body.id) : randomBytes(8).toString('hex')
@@ -1892,16 +1913,16 @@ async function saveLaunchPresetNow(body) {
   const existingEntry = index >= 0 ? presets[index] : null
   const updateChannel = requestedChannel ?? safeUpdateChannel(existingEntry?.updateChannel)
   const config = await loadConfig()
-  const wslVersion = backend === 'wsl' ? (String(wslInfo?.version || '').match(/[0-9][0-9A-Za-z._+-]*/)?.[0] || '') : ''
+  const systemWslVersion = backend === 'wsl' ? (String(wslInfo?.version || '').match(/[0-9][0-9A-Za-z._+-]*/)?.[0] || '') : ''
   const effectiveVersion = backend === 'wsl'
-    ? (version === 'auto' ? wslVersion : version)
+    ? (wslVersion || (version === 'auto' ? systemWslVersion : version))
     : resolvePresetVersion({ version, profile, updateChannel }, home, config)
   const sameBackend = (existingEntry?.backend === 'wsl') === (backend === 'wsl')
   const sameWslScope = backend !== 'wsl'
     || ((existingEntry?.wslDistro || WSL_SETTINGS.defaultDistro) === wslDistro
       && (existingEntry?.wslHome || '') === (wslHome || ''))
   const tripleChanged = !existingEntry || existingEntry.version !== version || existingEntry.profile !== profile
-    || !sameBackend || !sameWslScope
+    || !sameBackend || !sameWslScope || (existingEntry?.wslVersion || '') !== wslVersion
     || (backend === 'local' && (existingEntry.dshHome || defaultHome()) !== home)
     || (version === 'auto' && safeUpdateChannel(existingEntry.updateChannel) !== updateChannel)
   if (tripleChanged && effectiveVersion && presets.some((item) => {
@@ -1910,6 +1931,7 @@ async function saveLaunchPresetNow(body) {
     if (backend === 'wsl') {
       if (item.backend !== 'wsl' || (item.wslDistro || WSL_SETTINGS.defaultDistro) !== wslDistro) return false
       if ((item.wslHome || '') !== (wslHome || '')) return false
+      if ((item.wslVersion || '') !== wslVersion) return false
       return item.version === version
     }
     if (item.backend === 'wsl' || (item.dshHome || defaultHome()) !== home) return false
@@ -1931,7 +1953,7 @@ async function saveLaunchPresetNow(body) {
     ...(existingEntry?.usedVersion ? { usedVersion: existingEntry.usedVersion } : {}),
     ...(existingEntry?.prevVersion ? { prevVersion: existingEntry.prevVersion } : {}),
     ...(backend === 'wsl'
-      ? { backend: 'wsl', wslDistro, ...(wslHome ? { wslHome } : {}), ...(wslWorkdir ? { wslWorkdir } : {}), wslServiceMode: DEFAULT_WSL_SERVICE_MODE }
+      ? { backend: 'wsl', wslDistro, ...(wslHome ? { wslHome } : {}), ...(wslWorkdir ? { wslWorkdir } : {}), ...(wslVersion ? { wslVersion } : {}), wslServiceMode: DEFAULT_WSL_SERVICE_MODE }
       : { ...(workdir ? { workdir } : {}), ...(dshHome ? { dshHome } : {}) }),
     ...(icon !== 'terminal' ? { icon } : {}) }
   if (index >= 0) presets[index] = entry
@@ -4779,6 +4801,77 @@ async function install(version) {
   }
 }
 
+/** 版本管理弹窗在 WSL 启动项下打开时，这里把请求里的发行版/用户目录补全成一套可执行目标。 */
+function wslVersionTarget(body = {}) {
+  const distro = safeWslDistro(body.distro) || launchDistro()
+  if (!distro) throw new Error('先选择一个 WSL 发行版')
+  const home = safeWslPath(body.home, 'WSL 用户目录') || launchWslHome()
+  return { distro, home }
+}
+
+/** WSL 版本列表：托管版本来自 ~/.dsh-x/versions，system 是发行版自己装的那份。 */
+async function readWslVersionInfo(distro, home) {
+  const managed = await listWslVersions(distro, home)
+  const info = await inspectWslDistro(distro, home, { force: true, dshCommand: WSL_SETTINGS.dshCommand || 'dsh' })
+  const systemVersion = (String(info.version || '').match(/[0-9][0-9A-Za-z._+-]*/) || [])[0] || ''
+  return {
+    distro,
+    home: managed.home || info.dshHome || home,
+    versions: managed.versions,
+    system: info.ok && systemVersion ? { version: systemVersion, command: info.dshCommand, path: info.dshPath } : null,
+  }
+}
+
+async function installWslDsh(body = {}) {
+  const { distro, home } = wslVersionTarget(body)
+  const ver = safeVersion(body.version)
+  if (ver === 'auto') throw new Error('WSL 版本要指定具体版本号')
+  if (wslInstalling) throw new Error(`WSL 里正在安装 ${wslInstalling}，请等它完成`)
+  const before = await listWslVersions(distro, home)
+  if (before.versions.includes(ver)) return readWslVersionInfo(distro, home)
+  wslInstalling = distro + '@' + ver
+  wslInstallProgress = { kind: 'wsl', distro, version: ver, phase: 'resolve' }
+  await emitState()
+  emit('progress', wslInstallProgress)
+  pushLog(`在 WSL ${distro} 里安装 ${PKG}@${ver}`)
+  const counter = { resolved: 0, fetched: 0, total: 0 }
+  try {
+    await installWslVersion(distro, ver, {
+      home,
+      registry: currentRegistry(),
+      onLine: (line) => {
+        // npm 的 http 行一步一条，全打进日志会把启动日志刷满；进度条已经另有显示。
+        if (line && !/^npm (?:http|warn|notice)/i.test(line) && !NOISY_LOG_RE.test(line)) pushLog('[WSL] ' + line)
+        const progress = parseInstallProgress(line, counter)
+        if (progress) {
+          wslInstallProgress = { kind: 'wsl', distro, version: ver, ...progress }
+          emit('progress', wslInstallProgress)
+        }
+      },
+    })
+    pushLog(`WSL ${distro} 里的 ${ver} 安装完成`)
+    return await readWslVersionInfo(distro, home)
+  } finally {
+    wslInstalling = ''
+    wslInstallProgress = null
+    emit('progress', { kind: 'wsl', phase: 'idle' })
+    await emitState()
+  }
+}
+
+async function uninstallWslDsh(body = {}) {
+  const { distro, home } = wslVersionTarget(body)
+  const ver = safeVersion(body.version)
+  if (ver === 'auto') throw new Error('WSL 版本要指定具体版本号')
+  if (wslInstalling) throw new Error(`WSL 里正在安装 ${wslInstalling}，请等它完成`)
+  const running = instanceList().find((proc) => proc.backend === 'wsl' && proc.distro === distro && proc.version === ver && ['running', 'starting', 'stopping'].includes(proc.status))
+  if (running) throw new Error(`WSL 里的 ${ver} 还有实例在${running.status === 'stopping' ? '停止' : '运行'}，先停止再卸载`)
+  await uninstallWslVersion(distro, ver, { home })
+  pushLog(`已删除 WSL ${distro} 里的 ${ver}`)
+  await emitState()
+  return readWslVersionInfo(distro, home)
+}
+
 /** npm 整理时会移动文件，启动准备和插件命令也必须纳入互斥，不能只看已启动的进程。 */
 async function optimizeVersion(version) {
   const ver = safeVersion(version)
@@ -5352,7 +5445,8 @@ async function bootWslOnce(ver, prof, context, onStarted) {
         home: wslHome,
         workdir,
         port,
-        dshCommand: WSL_SETTINGS.dshCommand || 'dsh',
+        // 托管版本由 startWslNow 解析成绝对 bin.js 路径；这里若退回全局设置，启动项选中的版本就失效了。
+        dshCommand: context.dshCommand || WSL_SETTINGS.dshCommand || 'dsh',
         serviceMode: DEFAULT_WSL_SERVICE_MODE,
       })
     } catch (error) {
@@ -5378,6 +5472,8 @@ async function bootWslOnce(ver, prof, context, onStarted) {
       serviceMode: started.serviceMode,
       instanceId: started.instanceId,
       wslPort: port,
+      wslVersion: context.wslVersion || '',
+      dshCommand: context.dshCommand || WSL_SETTINGS.dshCommand || 'dsh',
     })
     onStarted?.(proc)
     await emitState()
@@ -5438,15 +5534,25 @@ async function startWslNow(version, profile = PROFILE_NAME, onStarted) {
   const distro = launchDistro()
   if (!distro) throw new Error('还没有选择 WSL 发行版（先在设置里选一个默认发行版，或给启动项指定）')
   const wslHome = launchWslHome()
-  const info = await inspectWslDistro(distro, wslHome, { force: true, dshCommand: WSL_SETTINGS.dshCommand || 'dsh' })
+  const launchId = launchScope.getStore()?.launchId
+  const preset = launchId ? safeLaunchPresets(loadSettingsSync().launchPresets).find((item) => item.id === launchId) : null
+  // 重启/托盘再次启动时不一定还找得到启动项：实例自己记着上次用的托管版本，按它重开，别当成系统 dsh。
+  const pinnedWslVersion = String(preset?.wslVersion || launchScope.getStore()?.wslVersion || '').trim()
+  let dshCommand = WSL_SETTINGS.dshCommand || 'dsh'
+  if (pinnedWslVersion) {
+    const managed = await listWslVersions(distro, wslHome)
+    if (!managed.versions.includes(pinnedWslVersion)) throw new Error(`WSL 里没有安装 dsh ${pinnedWslVersion}，先在版本管理里安装`)
+    dshCommand = wslManagedDshPath(managed.home || wslHome, pinnedWslVersion)
+  }
+  const info = await inspectWslDistro(distro, wslHome, { force: true, dshCommand })
   if (!info.ok) throw new Error(info.error || `WSL 发行版 ${distro} 里的 dsh 不可用`)
   const detected = (String(info.version || '').match(/[0-9][0-9A-Za-z._+-]*/) || [])[0] || ''
-  const ver = requested === 'auto' ? detected : requested
+  // 固定了托管版本的启动项以托管版本为准；没固定时才按启动项写的版本/自动探测。
+  const ver = pinnedWslVersion || (requested === 'auto' ? detected : requested)
   if (!ver) throw new Error('没读到 WSL 里 dsh 的版本号，先在 WSL 里运行 dsh --version 确认')
   if (!VERSION_RE.test(ver)) throw new Error(`WSL 里的 dsh 版本号看起来不对：${info.version}`)
-  // WSL 里的 dsh 是发行版自己的一份，启动器不能像 Windows 版本目录那样切旧版；
-  // 启动项若钉着一个版本而 WSL 已升级，继续启动只会把实际版本记错，直接说清。
-  if (requested !== 'auto' && detected && requested !== detected) {
+  // 没固定托管版本时，WSL 里的 dsh 是发行版自己的一份，启动项钉的版本和它不同会记错实际版本。
+  if (!pinnedWslVersion && requested !== 'auto' && detected && requested !== detected) {
     throw new Error(`WSL 里的 dsh 是 ${detected}，和启动项钉的 ${requested} 不一致；改成自动，或先更新启动项`)
   }
   const existing = instances.get(instanceKey(ver, prof))
@@ -5460,7 +5566,7 @@ async function startWslNow(version, profile = PROFILE_NAME, onStarted) {
   if (!info.profiles.includes(prof) && !TEMPLATE_PROFILES.includes(prof)) {
     throw new Error(`WSL 里没有 profile ${prof}（先在 WSL 里用 dsh 建一次）`)
   }
-  return bootWslOnce(ver, prof, { distro, wslHome, workdir: launchWslWorkdir() }, onStarted)
+  return bootWslOnce(ver, prof, { distro, wslHome, workdir: launchWslWorkdir(), dshCommand, wslVersion: pinnedWslVersion }, onStarted)
 }
 
 /**
@@ -5677,7 +5783,7 @@ export async function launchInstalled() {
   if (live?.status === 'starting') {
     // WSL 实例的 scope 必须带上发行版和 WSL 目录，只传合成 home 会被当成 Windows 本机启动。
     const scope = live.backend === 'wsl'
-      ? { backend: 'wsl', home: live.home, wslDistro: live.distro, wslHome: live.wslHome, wslWorkdir: live.wslWorkdir }
+      ? { backend: 'wsl', home: live.home, wslDistro: live.distro, wslHome: live.wslHome, wslWorkdir: live.wslWorkdir, wslVersion: live.wslVersion || '' }
       : { home: live.home }
     const result = await launchScope.run(scope, () => start(live.version, live.profile))
     return { version: live.version, url: result.url }
@@ -5694,13 +5800,13 @@ export async function launchInstalled() {
  * 某个起不来不拦着后面的，但错误要往上抛——页面得知道有实例没回来。
  */
 export async function restartInstalled() {
-  const targets = instanceList().map((proc) => ({ version: proc.version, profile: proc.profile, home: proc.home, backend: proc.backend, distro: proc.distro, wslHome: proc.wslHome, wslWorkdir: proc.wslWorkdir }))
+  const targets = instanceList().map((proc) => ({ version: proc.version, profile: proc.profile, home: proc.home, backend: proc.backend, distro: proc.distro, wslHome: proc.wslHome, wslWorkdir: proc.wslWorkdir, wslVersion: proc.wslVersion || '' }))
   if (!targets.length) return launchInstalled()
   await stop()
   let last = null
   let failure = null
-  const results = await Promise.allSettled(targets.map(({ version, profile, home, backend, distro, wslHome, wslWorkdir }) =>
-    launchScope.run(backend === 'wsl' ? { backend: 'wsl', home, wslDistro: distro, wslHome, wslWorkdir } : { home }, () => start(version, profile))))
+  const results = await Promise.allSettled(targets.map(({ version, profile, home, backend, distro, wslHome, wslWorkdir, wslVersion }) =>
+    launchScope.run(backend === 'wsl' ? { backend: 'wsl', home, wslDistro: distro, wslHome, wslWorkdir, wslVersion } : { home }, () => start(version, profile))))
   for (const [index, result] of results.entries()) {
     if (result.status === 'fulfilled') last = { version: targets[index].version, profile: targets[index].profile, url: result.value.url }
     else failure = failure || result.reason
@@ -6516,11 +6622,44 @@ async function handleApi(req, res, url) {
       if (distro) {
         let home = ''
         try { home = safeWslPath(url.searchParams.get('home') || '', 'WSL 用户目录') } catch { home = '' }
-        inspect = await inspectWslDistro(distro, home || WSL_SETTINGS.defaultHome, { force: refresh, dshCommand: WSL_SETTINGS.dshCommand || 'dsh' })
+        let dshCommand = WSL_SETTINGS.dshCommand || 'dsh'
+        const requestedVersion = String(url.searchParams.get('version') || '').trim()
+        if (requestedVersion) {
+          // 选了托管版本时，profile 探测也必须用那一份 dsh；系统里没装 dsh 也能正常准备启动项。
+          const managed = await listWslVersions(distro, home || WSL_SETTINGS.defaultHome)
+          dshCommand = wslManagedDshPath(managed.home || home || WSL_SETTINGS.defaultHome, requestedVersion)
+        }
+        inspect = await inspectWslDistro(distro, home || WSL_SETTINGS.defaultHome, { force: refresh, dshCommand })
       }
       send(res, 200, { available: listed.available, distros: listed.distros, error: listed.error || '', defaults: safeWslSettings(WSL_SETTINGS), inspect })
     } catch (error) {
       send(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+    return
+  }
+  if (req.method === 'GET' && url.pathname === '/api/wsl/versions') {
+    // WSL 内由 DSH-X 安装的版本 + 发行版自带 dsh 的版本，版本管理弹窗按这个列表渲染。
+    try {
+      const target = wslVersionTarget({ distro: url.searchParams.get('distro') || '', home: url.searchParams.get('home') || '' })
+      send(res, 200, await readWslVersionInfo(target.distro, target.home))
+    } catch (error) {
+      send(res, 400, { error: error instanceof Error ? error.message : String(error) })
+    }
+    return
+  }
+  if (req.method === 'POST' && url.pathname === '/api/wsl/install') {
+    try {
+      send(res, 200, await installWslDsh(body))
+    } catch (error) {
+      send(res, 500, { error: error instanceof Error ? error.message : String(error) })
+    }
+    return
+  }
+  if (req.method === 'POST' && url.pathname === '/api/wsl/uninstall') {
+    try {
+      send(res, 200, await uninstallWslDsh(body))
+    } catch (error) {
+      send(res, 500, { error: error instanceof Error ? error.message : String(error) })
     }
     return
   }
@@ -6674,6 +6813,7 @@ async function handleApi(req, res, url) {
     res.write(`event: log\ndata: ${JSON.stringify({ lines: logs.slice(-120) })}\n\n`)
     res.write(`event: state\ndata: ${JSON.stringify(await snapshot())}\n\n`)
     if (installProgress) res.write(`event: progress\ndata: ${JSON.stringify(installProgress)}\n\n`)
+    if (wslInstallProgress) res.write(`event: progress\ndata: ${JSON.stringify(wslInstallProgress)}\n\n`)
     if (pluginProgress) res.write(`event: progress\ndata: ${JSON.stringify({ ...pluginProgress, kind: 'plugin', name: pluginProgressName, profile: pluginProgressProfile })}\n\n`)
     // 整合包：检查和安装都可能几十秒（下载 + 解包 + pnpm），刷新页面要能接着显示
     if (packProgress) res.write(`event: progress\ndata: ${JSON.stringify({ ...packProgress, kind: 'pack', name: packProgressName })}\n\n`)

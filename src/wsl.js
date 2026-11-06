@@ -25,6 +25,7 @@ SOFTWARE.
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
+import { StringDecoder } from 'node:string_decoder'
 import { join } from 'node:path'
 import { WSL_AGENT_SCRIPT } from './wsl-scripts.js'
 
@@ -65,10 +66,34 @@ function runProcess(command, args, options = {}) {
     const err = []
     let settled = false
     let timer
+    // 安装类命令要边跑边把 npm 的输出喂给进度条；其余调用不传 onLine，行为完全不变。
+    // 用 StringDecoder 避免一个 UTF-8 字符刚好跨 chunk 时被拆坏。
+    const decoders = options.onLine ? { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') } : null
+    const pending = { stdout: '', stderr: '' }
+    const feed = (kind, chunk) => {
+      if (!decoders || settled) return
+      pending[kind] += decoders[kind].write(chunk)
+      let index
+      while ((index = pending[kind].indexOf('\n')) >= 0) {
+        const line = pending[kind].slice(0, index).replace(/\r$/, '')
+        pending[kind] = pending[kind].slice(index + 1)
+        if (line) options.onLine(line, kind)
+      }
+    }
+    const flushLines = () => {
+      if (!decoders) return
+      for (const kind of ['stdout', 'stderr']) {
+        pending[kind] += decoders[kind].end()
+        const line = pending[kind].replace(/\r$/, '')
+        if (line) options.onLine(line, kind)
+        pending[kind] = ''
+      }
+    }
     const finish = (result) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      flushLines()
       const stdout = raw ? Buffer.concat(out) : Buffer.concat(out).toString('utf8')
       const stderr = Buffer.concat(err).toString('utf8')
       resolve(Object.assign({}, result, { stdout: stdout, stderr: stderr }))
@@ -77,8 +102,8 @@ function runProcess(command, args, options = {}) {
       try { child.kill('SIGKILL') } catch { /* 已经退出 */ }
       finish({ ok: false, code: null, timedOut: true })
     }, timeoutMs)
-    child.stdout.on('data', (chunk) => out.push(chunk))
-    child.stderr.on('data', (chunk) => err.push(chunk))
+    child.stdout.on('data', (chunk) => { out.push(chunk); feed('stdout', chunk) })
+    child.stderr.on('data', (chunk) => { err.push(chunk); feed('stderr', chunk) })
     child.on('error', (error) => finish({ ok: false, code: null, error: error }))
     // 用 close 而不是 exit：exit 触发时 stdio 可能还没排空，探测输出会被截断。
     child.on('close', (code) => finish({ ok: code === 0, code: code }))
@@ -281,6 +306,116 @@ export function buildAgentInstallScript(text = WSL_AGENT_SCRIPT, name = 'dsh-x-w
     'mv -f "$tmp" "$target"',
     'printf "%s\\n" "$target"',
   ].join('\n')
+}
+
+/** WSL 里启动器自己装的 dsh 版本放在 $HOME/.dsh-x/versions/<版本>，与 Windows 侧同构。 */
+const WSL_VERSION_RE = /^[0-9A-Za-z][0-9A-Za-z._+-]*$/
+
+function assertWslVersion(version) {
+  const text = String(version || '').trim()
+  if (!text || text === 'auto' || !WSL_VERSION_RE.test(text)) throw new Error('非法的 WSL dsh 版本号')
+  return text
+}
+
+/** 把启动项里的 WSL 用户目录（~ 或绝对路径）展开成绝对路径的 shell 片段。 */
+function wslHomePrelude(home) {
+  return [
+    'home=' + shellQuote(home || DEFAULT_HOME),
+    'case "$home" in',
+    '  "~") home="$HOME" ;;',
+    '  "~/"*) home="$HOME/${home:2}" ;;',
+    'esac',
+  ]
+}
+
+/** 列出 WSL 里由 DSH-X 安装的 dsh 版本；只认 bin.js 完整的目录，半截安装不显示。 */
+export async function listWslVersions(distro, home) {
+  if (!distro) throw new Error('还没有选择 WSL 发行版')
+  const script = [
+    'set -eu',
+    ...wslHomePrelude(home),
+    'printf \'__DSHX_DSH_HOME__%s\\n\' "$home"',
+    'root="$home/.dsh-x/versions"',
+    'if [ -d "$root" ]; then',
+    '  for dir in "$root"/*; do',
+    '    [ -d "$dir" ] || continue',
+    '    name="${dir##*/}"',
+    '    if [ -f "$dir/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then',
+    '      printf \'__DSHX_VER__%s\\n\' "$name"',
+    '    fi',
+    '  done',
+    'fi',
+  ].join('\n')
+  const result = await wslBash(distro, script, { timeoutMs: 20000 })
+  if (!result.ok) throw new Error('读取 WSL 里的 dsh 版本失败：' + (result.stderr.trim() || result.stdout.trim() || '未知错误'))
+  let homePath = ''
+  const versions = []
+  for (const line of String(result.stdout || '').split(/\r?\n/)) {
+    if (line.indexOf('__DSHX_DSH_HOME__') === 0) homePath = line.slice('__DSHX_DSH_HOME__'.length).trim()
+    else if (line.indexOf('__DSHX_VER__') === 0) versions.push(line.slice('__DSHX_VER__'.length).trim())
+  }
+  versions.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+  return { home: homePath, versions }
+}
+
+/** 这台 WSL 里、由启动器安装的 dsh 的 bin.js 绝对路径。 */
+export function wslManagedDshPath(home, version) {
+  const raw = String(home || '').trim()
+  const base = raw.replace(/\/+$/, '')
+  // 空目录拼出来会变成相对路径；明确报错比启动时才炸好。用户目录正好是根时保留一个斜杠。
+  if (!base) {
+    if (!raw) throw new Error('WSL 用户目录为空，无法定位托管版本')
+    return '/.dsh-x/versions/' + assertWslVersion(version) + '/node_modules/@deepseek-ai/dsh/lib/bin.js'
+  }
+  return base + '/.dsh-x/versions/' + assertWslVersion(version) + '/node_modules/@deepseek-ai/dsh/lib/bin.js'
+}
+
+/** 在 WSL 里用 npm 安装一份指定版本的 dsh。npm 的输出通过 onLine 喂给安装进度。 */
+export async function installWslVersion(distro, version, options = {}) {
+  const ver = assertWslVersion(version)
+  const registry = options.registry ? 'npm_config_registry=' + shellQuote(options.registry) + ' ' : ''
+  const script = [
+    'set -eu',
+    ...wslHomePrelude(options.home),
+    'printf \'__DSHX_DSH_HOME__%s\\n\' "$home"',
+    'command -v npm >/dev/null 2>&1 || { echo "WSL 里找不到 npm，先在发行版里安装 Node.js/npm" >&2; exit 127; }',
+    'dir="$home/.dsh-x/versions/' + ver + '"',
+    'mkdir -p "$dir"',
+    'cd "$dir"',
+    'if [ ! -f package.json ]; then printf \'%s\\n\' \'{"private":true}\' > package.json; fi',
+    registry + 'npm install --prefer-dedupe --save-exact --omit=dev --no-audit --no-fund --package-lock=false --loglevel=http --no-progress "@deepseek-ai/dsh@' + ver + '"',
+    'test -f "$dir/node_modules/@deepseek-ai/dsh/lib/bin.js"',
+    'printf \'__DSHX_INSTALLED__%s\\n\' "$dir"',
+  ].join('\n')
+  const result = await wslBash(distro, script, {
+    timeoutMs: options.timeoutMs || 20 * 60 * 1000,
+    onLine: options.onLine,
+  })
+  if (!result.ok) {
+    const detail = String(result.stderr || '').trim().split(/\r?\n/).slice(-3).join(' ') || String(result.stdout || '').trim().split(/\r?\n/).slice(-3).join(' ')
+    throw new Error('WSL 里安装 dsh ' + ver + ' 失败：' + (detail || '未知错误'))
+  }
+  let homePath = ''
+  let installed = ''
+  for (const line of String(result.stdout || '').split(/\r?\n/)) {
+    if (line.indexOf('__DSHX_DSH_HOME__') === 0) homePath = line.slice('__DSHX_DSH_HOME__'.length).trim()
+    else if (line.indexOf('__DSHX_INSTALLED__') === 0) installed = line.slice('__DSHX_INSTALLED__'.length).trim()
+  }
+  return { version: ver, home: homePath, path: installed }
+}
+
+/** 删除 WSL 里由启动器安装的某个 dsh 版本目录。 */
+export async function uninstallWslVersion(distro, version, options = {}) {
+  const ver = assertWslVersion(version)
+  const script = [
+    'set -eu',
+    ...wslHomePrelude(options.home),
+    'dir="$home/.dsh-x/versions/' + ver + '"',
+    'rm -rf "$dir"',
+  ].join('\n')
+  const result = await wslBash(distro, script, { timeoutMs: 60000 })
+  if (!result.ok) throw new Error('删除 WSL 里的 dsh ' + ver + ' 失败：' + (result.stderr.trim() || result.stdout.trim() || '未知错误'))
+  return { version: ver }
 }
 
 async function installAgentScript(distro) {

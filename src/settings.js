@@ -558,7 +558,12 @@ export function safeLaunchPresets(value) {
     let wslDistro = ''
     let wslHome = ''
     let wslWorkdir = ''
+    let wslVersion = ''
     if (backend === 'wsl') {
+      // wslVersion 空 = 用 WSL 里系统装的那份 dsh；非空 = DSH-X 在 WSL 内装的托管版本。
+      // auto 只是启动时的取值方式，不能存成托管版本，否则每次启动都会找一个叫 auto 的目录。
+      wslVersion = String(item.wslVersion ?? '').trim()
+      if (wslVersion && (wslVersion === 'auto' || !VERSION_RE.test(wslVersion))) return []
       // WSL 项不碰 Windows 的 safeDshHome / safeWorkdir：那些函数要求盘符绝对路径，
       // 会把 /root/.dsh 当相对路径拒掉。路径按 Linux 语义单独校验。
       try {
@@ -588,7 +593,7 @@ export function safeLaunchPresets(value) {
       ...(VERSION_RE.test(usedVersion) && usedVersion !== 'auto' ? { usedVersion } : {}),
       ...(VERSION_RE.test(prevVersion) && prevVersion !== 'auto' ? { prevVersion } : {}),
       ...(workdir ? { workdir } : {}), ...(dshHome ? { dshHome } : {}),
-      ...(backend === 'wsl' ? { backend: 'wsl', ...(wslDistro ? { wslDistro } : {}), ...(wslHome ? { wslHome } : {}), ...(wslWorkdir ? { wslWorkdir } : {}), wslServiceMode: DEFAULT_WSL_SERVICE_MODE } : {}),
+      ...(backend === 'wsl' ? { backend: 'wsl', ...(wslDistro ? { wslDistro } : {}), ...(wslHome ? { wslHome } : {}), ...(wslWorkdir ? { wslWorkdir } : {}), ...(wslVersion ? { wslVersion } : {}), wslServiceMode: DEFAULT_WSL_SERVICE_MODE } : {}),
       ...(icon !== 'terminal' ? { icon } : {}) }]
   })
   const builtin = presets.find((item) => item.id === DEFAULT_LAUNCH_ID) || { ...DEFAULT_LAUNCH }
